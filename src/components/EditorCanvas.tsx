@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import { NOTE_TYPES } from '../constants/editorConstants';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from '../utils/editorUtils';
-import type { EditorRuntimeState, NotePreview, ProjectData, SelectionBox } from '../types/editorTypes';
+import type { EditorRuntimeState, ProjectData, SelectionBox } from '../types/editorTypes';
 
 interface EditorCanvasProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
@@ -44,9 +44,6 @@ export default function EditorCanvas({
   onMouseUp,
   onMouseLeave,
   onContextMenu,
-  notePreview,
-  selectedNoteType,
-  noteWidth,
 }: EditorCanvasProps) {
   const animationFrameRef = useRef<number | null>(null);
   const lastPlayedTimeRef = useRef<number>(0);
@@ -251,23 +248,6 @@ export default function EditorCanvas({
       }
     });
 
-    if (notePreview) {
-      const previewBeat = getBeatAtTime(notePreview.time, sortedChanges);
-      const previewY = hitLineY - (previewBeat - currentBeat) * pixelsPerBeat;
-
-      if (previewY > -50 && previewY < height + 50) {
-        const previewX = startX + notePreview.lane * laneWidth;
-        const previewPixelWidth = (laneWidth / 2) * noteWidth;
-        const previewTypeInfo = NOTE_TYPES[selectedNoteType] || NOTE_TYPES[1];
-
-        ctx.strokeStyle = `${previewTypeInfo.color}aa`;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([4, 4]);
-        ctx.strokeRect(previewX + 2, previewY - 10, previewPixelWidth - 4, 20);
-        ctx.setLineDash([]);
-      }
-    }
-
     if (selectionBox) {
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 1;
@@ -292,7 +272,7 @@ export default function EditorCanvas({
     ctx.shadowBlur = 10;
     ctx.stroke();
     ctx.shadowBlur = 0;
-  }, [projectData, gridZoom, selectedNoteIds, selectionBox, notePreview, selectedNoteType, noteWidth, canvasRef, containerRef, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef]);
+  }, [projectData, gridZoom, selectedNoteIds, selectionBox, canvasRef, containerRef, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef]);
 
   useEffect(() => {
     const step = () => {
