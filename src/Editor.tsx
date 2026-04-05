@@ -303,7 +303,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
       
       const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
-      
+
       const snap = gridZoom;
       const snappedBeat = Math.round(clickBeat * snap) / snap;
       
