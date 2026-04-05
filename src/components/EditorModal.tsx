@@ -1,13 +1,14 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { X } from 'lucide-react';
+import type { ProjectFormData } from '../types/editorTypes';
 
 interface EditorModalProps {
   isOpen: boolean;
   onClose: () => void;
   onConfirm: () => void;
-  formData: any;
-  setFormData: (data: any) => void;
+  formData: ProjectFormData;
+  setFormData: React.Dispatch<React.SetStateAction<ProjectFormData>>;
   mode?: 'new' | 'import';
 }
 
