@@ -20,6 +20,9 @@ interface EditorCanvasProps {
   onMouseUp: () => void;
   onMouseLeave: () => void;
   onContextMenu: (e: React.MouseEvent<HTMLCanvasElement>) => void;
+  notePreview: NotePreview | null;
+  selectedNoteType: number;
+  noteWidth: number;
 }
 
 const HOLD_TYPES = [3, 4, 5, 6, 7, 11];

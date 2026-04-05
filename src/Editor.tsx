@@ -316,8 +316,39 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
           ? { ...n, time: snappedTime, lane } 
           : n
       ));
+      setNotePreview({ lane, time: snappedTime });
     } else if (selectionBox) {
       setSelectionBox(prev => prev ? { ...prev, endX: clickX, endY: clickY } : null);
+    } else {
+      const { width, height } = canvas;
+      const lanes = 8;
+      const laneWidth = Math.min(60, width / (lanes + 2));
+      const gridWidth = lanes * laneWidth;
+      const startX = (width - gridWidth) / 2;
+
+      if (clickX < startX || clickX > startX + gridWidth) {
+        setNotePreview(null);
+        return;
+      }
+
+      let lane = Math.floor((clickX - startX) / laneWidth);
+      lane = Math.max(0, Math.min(lanes - 1, lane));
+
+      const pixelsPerBeat = 150;
+      const hitLineY = height - 150;
+      const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+      const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
+      const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
+      const snap = gridZoom;
+      const snappedBeat = Math.round(clickBeat * snap) / snap;
+
+      if (snappedBeat < 0) {
+        setNotePreview(null);
+        return;
+      }
+
+      const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
+      setNotePreview({ lane, time: snappedTime });
     }
   };
 
@@ -809,8 +840,14 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
               onMouseDown={handleCanvasMouseDown}
               onMouseMove={handleCanvasMouseMove}
               onMouseUp={handleCanvasMouseUp}
-              onMouseLeave={handleCanvasMouseUp}
+              onMouseLeave={() => {
+                handleCanvasMouseUp();
+                setNotePreview(null);
+              }}
               onContextMenu={handleContextMenu}
+              notePreview={notePreview}
+              selectedNoteType={selectedNoteType}
+              noteWidth={noteWidth}
             />
           )}
         </section>
