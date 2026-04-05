@@ -1,15 +1,16 @@
-import React, { useEffect, useCallback } from 'react';
+import React, { useEffect, useRef, useCallback } from 'react';
 import { NOTE_TYPES } from '../constants/editorConstants';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from '../utils/editorUtils';
+import type { EditorRuntimeState, NotePreview, ProjectData, SelectionBox } from '../types/editorTypes';
 
 interface EditorCanvasProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   containerRef: React.RefObject<HTMLDivElement | null>;
-  projectData: any;
+  projectData: ProjectData | null;
   gridZoom: number;
-  stateRef: React.MutableRefObject<any>;
+  stateRef: React.MutableRefObject<EditorRuntimeState>;
   selectedNoteIds: number[];
-  selectionBox: {startX: number, startY: number, endX: number, endY: number} | null;
+  selectionBox: SelectionBox | null;
   timeDisplayRef: React.RefObject<HTMLDivElement | null>;
   progressBarRef: React.RefObject<HTMLInputElement | null>;
   isDraggingProgress: React.MutableRefObject<boolean>;
@@ -19,13 +20,37 @@ interface EditorCanvasProps {
   onMouseUp: () => void;
   onMouseLeave: () => void;
   onContextMenu: (e: React.MouseEvent<HTMLCanvasElement>) => void;
+  notePreview: NotePreview | null;
+  selectedNoteType: number;
+  noteWidth: number;
 }
 
-export default function EditorCanvas({ 
-  canvasRef, containerRef, projectData, gridZoom, stateRef, selectedNoteIds, selectionBox, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef,
-  onMouseDown, onMouseMove, onMouseUp, onMouseLeave, onContextMenu
+const HOLD_TYPES = [3, 4, 5, 6, 7, 11];
+
+export default function EditorCanvas({
+  canvasRef,
+  containerRef,
+  projectData,
+  gridZoom,
+  stateRef,
+  selectedNoteIds,
+  selectionBox,
+  timeDisplayRef,
+  progressBarRef,
+  isDraggingProgress,
+  audioRef,
+  onMouseDown,
+  onMouseMove,
+  onMouseUp,
+  onMouseLeave,
+  onContextMenu,
+  notePreview,
+  selectedNoteType,
+  noteWidth,
 }: EditorCanvasProps) {
-  
+  const animationFrameRef = useRef<number | null>(null);
+  const lastPlayedTimeRef = useRef<number>(0);
+
   const drawGrid = useCallback(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -38,19 +63,14 @@ export default function EditorCanvas({
     }
 
     const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!ctx || !projectData) return;
 
     const { width, height } = canvas;
     ctx.clearRect(0, 0, width, height);
 
-    if (!projectData) return;
-
     const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
 
-    const activeChange = getActiveChange(stateRef.current.currentTime, sortedChanges);
-    const bpm = activeChange.bpm;
     let time = stateRef.current.currentTime;
-    
     if (stateRef.current.isPlaying && audioRef.current) {
       time = audioRef.current.currentTime;
       stateRef.current.currentTime = time;
@@ -59,6 +79,7 @@ export default function EditorCanvas({
     if (timeDisplayRef.current) {
       timeDisplayRef.current.textContent = formatTime(time, sortedChanges);
     }
+
     if (progressBarRef.current && !isDraggingProgress.current) {
       progressBarRef.current.value = time.toString();
     }
@@ -72,11 +93,9 @@ export default function EditorCanvas({
     const gridWidth = lanes * laneWidth;
     const startX = (width - gridWidth) / 2;
 
-    // Draw background for the grid area
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.fillRect(startX, 0, gridWidth, height);
 
-    // Draw lanes
     ctx.strokeStyle = '#333';
     ctx.lineWidth = 1;
     for (let i = 0; i <= lanes; i++) {
@@ -87,46 +106,43 @@ export default function EditorCanvas({
       ctx.stroke();
     }
 
-    // Draw beats
     const beatsVisibleAbove = hitLineY / pixelsPerBeat;
     const beatsVisibleBelow = (height - hitLineY) / pixelsPerBeat;
-    
+
     const startBeat = Math.floor(currentBeat - beatsVisibleBelow);
     const endBeat = Math.ceil(currentBeat + beatsVisibleAbove);
 
-    // Pre-calculate measure boundaries
     const measureBoundaries = new Set<number>();
     const measureNumbers = new Map<number, number>();
     let currentMeasureBeat = 0;
     let measureCount = 0;
-    
+
     while (currentMeasureBeat <= endBeat) {
       measureBoundaries.add(currentMeasureBeat);
       measureNumbers.set(currentMeasureBeat, measureCount);
-      
+
       const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, sortedChanges);
       const activeChange = getActiveChange(timeAtMeasure + 0.001, sortedChanges);
       const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
-      
+
       currentMeasureBeat += beatsPerMeasure;
       measureCount++;
     }
 
-    // Draw beats and subdivisions
     const subdivisions = gridZoom;
     const step = 1 / subdivisions;
-    
+
     for (let b = startBeat; b <= endBeat; b += step) {
       if (b < 0) continue;
       const y = hitLineY - (b - currentBeat) * pixelsPerBeat;
-      
+
       const isBeatLine = Math.abs(Math.round(b) - b) < 0.001;
       const isMeasureLine = isBeatLine && measureBoundaries.has(Math.round(b));
 
       ctx.beginPath();
       ctx.moveTo(startX, y);
       ctx.lineTo(startX + gridWidth, y);
-      
+
       if (isMeasureLine) {
         ctx.strokeStyle = '#666';
         ctx.lineWidth = 2;
@@ -138,7 +154,7 @@ export default function EditorCanvas({
         ctx.lineWidth = 0.5;
       }
       ctx.stroke();
-      
+
       if (isMeasureLine) {
         ctx.fillStyle = '#888';
         ctx.font = '12px Inter, sans-serif';
@@ -148,12 +164,10 @@ export default function EditorCanvas({
       }
     }
 
-    // Draw BPM/Time Signature change indicators
     sortedChanges.forEach(change => {
       const changeBeat = getBeatAtTime(change.time, sortedChanges);
       const y = hitLineY - (changeBeat - currentBeat) * pixelsPerBeat;
-      
-      // Only draw indicators that are not at time 0 (as they are implied)
+
       if (change.time > 0 && y > 0 && y < height) {
         ctx.fillStyle = '#f59e0b';
         ctx.font = '10px Inter, sans-serif';
@@ -163,71 +177,72 @@ export default function EditorCanvas({
       }
     });
 
-    // Draw hold connections
-    stateRef.current.notes.forEach((note: any) => {
-      if ([3, 4, 5, 6, 7, 11].includes(note.type) && note.parentId !== null) {
-        const parentNote = stateRef.current.notes.find((n: any) => n.id === note.parentId);
-        if (parentNote && [3, 4, 5, 6, 7, 11].includes(parentNote.type)) {
+    stateRef.current.notes.forEach(note => {
+      if (HOLD_TYPES.includes(note.type) && note.parentId !== null) {
+        const parentNote = stateRef.current.notes.find(n => n.id === note.parentId);
+        if (parentNote && HOLD_TYPES.includes(parentNote.type)) {
           const noteBeat = getBeatAtTime(note.time, sortedChanges);
           const parentBeat = getBeatAtTime(parentNote.time, sortedChanges);
-          
+
           const y1 = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
           const y2 = hitLineY - (parentBeat - currentBeat) * pixelsPerBeat;
-          
-          // Only draw if at least part of the connection is visible
-          if ((y1 > -50 && y1 < height + 50) || (y2 > -50 && y2 < height + 50) || (y1 <= -50 && y2 >= height + 50) || (y2 <= -50 && y1 >= height + 50)) {
-            const notePixelWidth = (laneWidth / 2) * note.width;
-            const parentPixelWidth = (laneWidth / 2) * parentNote.width;
-            
-            const x1_left = startX + note.lane * laneWidth + 2;
-            const x1_right = x1_left + notePixelWidth - 4;
-            const x2_left = startX + parentNote.lane * laneWidth + 2;
-            const x2_right = x2_left + parentPixelWidth - 4;
 
-            const noteTypeInfo = NOTE_TYPES[note.type] || NOTE_TYPES[1];
-            
-            ctx.fillStyle = noteTypeInfo.color + '80'; // 50% opacity
-            ctx.beginPath();
-            ctx.moveTo(x1_left, y1);
-            ctx.lineTo(x1_right, y1);
-            ctx.lineTo(x2_right, y2);
-            ctx.lineTo(x2_left, y2);
-            ctx.closePath();
-            ctx.fill();
-            
-            ctx.strokeStyle = noteTypeInfo.color;
-            ctx.lineWidth = 1;
-            ctx.stroke();
-          }
+          const isVisible =
+            (y1 > -50 && y1 < height + 50) ||
+            (y2 > -50 && y2 < height + 50) ||
+            (y1 <= -50 && y2 >= height + 50) ||
+            (y2 <= -50 && y1 >= height + 50);
+
+          if (!isVisible) return;
+
+          const notePixelWidth = (laneWidth / 2) * note.width;
+          const parentPixelWidth = (laneWidth / 2) * parentNote.width;
+
+          const x1Left = startX + note.lane * laneWidth + 2;
+          const x1Right = x1Left + notePixelWidth - 4;
+          const x2Left = startX + parentNote.lane * laneWidth + 2;
+          const x2Right = x2Left + parentPixelWidth - 4;
+
+          const noteTypeInfo = NOTE_TYPES[note.type] || NOTE_TYPES[1];
+          ctx.fillStyle = `${noteTypeInfo.color}80`;
+
+          ctx.beginPath();
+          ctx.moveTo(x1Left, y1);
+          ctx.lineTo(x1Right, y1);
+          ctx.lineTo(x2Right, y2);
+          ctx.lineTo(x2Left, y2);
+          ctx.closePath();
+          ctx.fill();
+
+          ctx.strokeStyle = noteTypeInfo.color;
+          ctx.lineWidth = 1;
+          ctx.stroke();
         }
       }
     });
 
-    // Draw notes
-    stateRef.current.notes.forEach((note: any) => {
+    stateRef.current.notes.forEach(note => {
       const noteBeat = getBeatAtTime(note.time, sortedChanges);
       const y = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
-      
+
       if (y > -50 && y < height + 50) {
         const x = startX + note.lane * laneWidth;
         const notePixelWidth = (laneWidth / 2) * note.width;
-        
+
         const noteTypeInfo = NOTE_TYPES[note.type] || NOTE_TYPES[1];
         ctx.fillStyle = noteTypeInfo.color;
         ctx.fillRect(x + 2, y - 10, notePixelWidth - 4, 20);
-        
+
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = 2;
         ctx.strokeRect(x + 2, y - 10, notePixelWidth - 4, 20);
 
-        // Highlight if selected
         if (selectedNoteIds.includes(note.id)) {
           ctx.strokeStyle = '#ff00ff';
           ctx.lineWidth = 4;
           ctx.strokeRect(x, y - 12, notePixelWidth, 24);
         }
 
-        // Draw note ID
         ctx.fillStyle = '#ffffff';
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'center';
@@ -236,7 +251,23 @@ export default function EditorCanvas({
       }
     });
 
-    // Draw selection box
+    if (notePreview) {
+      const previewBeat = getBeatAtTime(notePreview.time, sortedChanges);
+      const previewY = hitLineY - (previewBeat - currentBeat) * pixelsPerBeat;
+
+      if (previewY > -50 && previewY < height + 50) {
+        const previewX = startX + notePreview.lane * laneWidth;
+        const previewPixelWidth = (laneWidth / 2) * noteWidth;
+        const previewTypeInfo = NOTE_TYPES[selectedNoteType] || NOTE_TYPES[1];
+
+        ctx.strokeStyle = `${previewTypeInfo.color}aa`;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(previewX + 2, previewY - 10, previewPixelWidth - 4, 20);
+        ctx.setLineDash([]);
+      }
+    }
+
     if (selectionBox) {
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 1;
@@ -245,37 +276,68 @@ export default function EditorCanvas({
         Math.min(selectionBox.startX, selectionBox.endX),
         Math.min(selectionBox.startY, selectionBox.endY),
         Math.abs(selectionBox.endX - selectionBox.startX),
-        Math.abs(selectionBox.endY - selectionBox.startY)
+        Math.abs(selectionBox.endY - selectionBox.startY),
       );
       ctx.setLineDash([]);
     }
 
-    // Draw hit line
     ctx.strokeStyle = '#fff';
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(startX, hitLineY);
     ctx.lineTo(startX + gridWidth, hitLineY);
     ctx.stroke();
-    
+
     ctx.shadowColor = '#fff';
     ctx.shadowBlur = 10;
     ctx.stroke();
     ctx.shadowBlur = 0;
-
-  }, [projectData, gridZoom, selectedNoteIds, selectionBox, canvasRef, containerRef, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef]);
+  }, [projectData, gridZoom, selectedNoteIds, selectionBox, notePreview, selectedNoteType, noteWidth, canvasRef, containerRef, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef]);
 
   useEffect(() => {
-    drawGrid();
-  }, [drawGrid]);
+    const step = () => {
+      if (stateRef.current.isPlaying && audioRef.current) {
+        const currentTime = audioRef.current.currentTime;
+        const lastTime = lastPlayedTimeRef.current;
 
-  return <canvas 
-    ref={canvasRef} 
-    className="absolute inset-0 w-full h-full cursor-crosshair"
-    onMouseDown={onMouseDown}
-    onMouseMove={onMouseMove}
-    onMouseUp={onMouseUp}
-    onMouseLeave={onMouseLeave}
-    onContextMenu={onContextMenu}
-  />;
+        stateRef.current.notes.forEach(note => {
+          if (note.time > lastTime && note.time <= currentTime) {
+            const noteTypeInfo = NOTE_TYPES[note.type];
+            if (noteTypeInfo?.sound) {
+              const hitSound = new Audio(noteTypeInfo.sound);
+              hitSound.volume = 0.5;
+              hitSound.play().catch(() => {});
+            }
+          }
+        });
+
+        lastPlayedTimeRef.current = currentTime;
+      } else {
+        lastPlayedTimeRef.current = stateRef.current.currentTime;
+      }
+
+      drawGrid();
+      animationFrameRef.current = requestAnimationFrame(step);
+    };
+
+    animationFrameRef.current = requestAnimationFrame(step);
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [drawGrid, stateRef, audioRef]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="absolute inset-0 w-full h-full cursor-crosshair"
+      onMouseDown={onMouseDown}
+      onMouseMove={onMouseMove}
+      onMouseUp={onMouseUp}
+      onMouseLeave={onMouseLeave}
+      onContextMenu={onContextMenu}
+    />
+  );
 }
