@@ -50,8 +50,3 @@ export interface EditorRuntimeState {
   offset: number;
   notes: Note[];
 }
-
-export interface NotePreview {
-  lane: number;
-  time: number;
-}

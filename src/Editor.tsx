@@ -5,7 +5,7 @@ import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat,
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
 import { NOTE_TYPES, AVAILABLE_NOTE_TYPES } from './constants/editorConstants';
-import type { BpmChange, EditorRuntimeState, Note, NotePreview, ProjectData, ProjectFormData, SelectionBox } from './types/editorTypes';
+import type { BpmChange, EditorRuntimeState, Note, ProjectData, ProjectFormData, SelectionBox } from './types/editorTypes';
 
 export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'new' | 'import' }) {
   const [isModalOpen, setIsModalOpen] = useState(mode === 'new');
@@ -17,7 +17,6 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
   const [selectedNoteIds, setSelectedNoteIds] = useState<number[]>([]);
   const [draggingNoteId, setDraggingNoteId] = useState<number | null>(null);
   const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
-  const [hoverPreview, setHoverPreview] = useState<NotePreview | null>(null);
   const nextNoteIdRef = useRef<number>(1);
   const [formData, setFormData] = useState<ProjectFormData>({
     songId: '',
@@ -317,7 +316,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
           ? { ...n, time: snappedTime, lane } 
           : n
       ));
-      setHoverPreview({ lane, time: snappedTime });
+      setNotePreview({ lane, time: snappedTime });
     } else if (selectionBox) {
       setSelectionBox(prev => prev ? { ...prev, endX: clickX, endY: clickY } : null);
     } else {
@@ -328,7 +327,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       const startX = (width - gridWidth) / 2;
 
       if (clickX < startX || clickX > startX + gridWidth) {
-        setHoverPreview(null);
+        setNotePreview(null);
         return;
       }
 
@@ -344,12 +343,12 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       const snappedBeat = Math.round(clickBeat * snap) / snap;
 
       if (snappedBeat < 0) {
-        setHoverPreview(null);
+        setNotePreview(null);
         return;
       }
 
       const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
-      setHoverPreview({ lane, time: snappedTime });
+      setNotePreview({ lane, time: snappedTime });
     }
   };
 
@@ -843,10 +842,10 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
               onMouseUp={handleCanvasMouseUp}
               onMouseLeave={() => {
                 handleCanvasMouseUp();
-                setHoverPreview(null);
+                setNotePreview(null);
               }}
               onContextMenu={handleContextMenu}
-              hoverPreview={hoverPreview}
+              notePreview={notePreview}
               selectedNoteType={selectedNoteType}
               noteWidth={noteWidth}
             />
