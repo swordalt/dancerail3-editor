@@ -1,6 +1,8 @@
-export const convertBpmChangesToTime = (changes: {measure: number, beat: number, bpm: number, timeSignature: string}[]) => {
+import type { BpmChange, TimeChange } from '../types/editorTypes';
+
+export const convertBpmChangesToTime = (changes: BpmChange[]) => {
   const sortedChanges = [...changes].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
-  const timeChanges: {time: number, bpm: number, timeSignature: string}[] = [];
+  const timeChanges: TimeChange[] = [];
   
   let currentTime = 0;
   let lastMeasure = 0;
@@ -25,7 +27,7 @@ export const convertBpmChangesToTime = (changes: {measure: number, beat: number,
   return timeChanges;
 };
 
-export const getActiveChange = (time: number, changes: {time: number, bpm: number, timeSignature: string}[]) => {
+export const getActiveChange = (time: number, changes: TimeChange[]) => {
   const sortedChanges = [...changes].sort((a, b) => a.time - b.time);
   let activeChange = sortedChanges[0];
   for (const change of sortedChanges) {
@@ -38,7 +40,7 @@ export const getActiveChange = (time: number, changes: {time: number, bpm: numbe
   return activeChange;
 };
 
-export const getBeatAtTime = (time: number, changes: {time: number, bpm: number, timeSignature: string}[]) => {
+export const getBeatAtTime = (time: number, changes: TimeChange[]) => {
   const sortedChanges = [...changes].sort((a, b) => a.time - b.time);
   let accumulatedBeats = 0;
   let lastTime = 0;
@@ -60,7 +62,7 @@ export const getBeatAtTime = (time: number, changes: {time: number, bpm: number,
   return accumulatedBeats;
 };
 
-export const getTimeAtBeat = (beat: number, changes: {time: number, bpm: number, timeSignature: string}[]) => {
+export const getTimeAtBeat = (beat: number, changes: TimeChange[]) => {
   const sortedChanges = [...changes].sort((a, b) => a.time - b.time);
   let accumulatedBeats = 0;
   let lastTime = 0;
@@ -81,7 +83,7 @@ export const getTimeAtBeat = (beat: number, changes: {time: number, bpm: number,
   return lastTime + (beat - accumulatedBeats) / (bpm / 60);
 };
 
-export const formatTime = (time: number, changes: {time: number, bpm: number, timeSignature: string}[]) => {
+export const formatTime = (time: number, changes: TimeChange[]) => {
   if (!changes || changes.length === 0) return '0:0.00/4';
   
   const totalBeats = getBeatAtTime(time, changes);

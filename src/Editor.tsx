@@ -5,6 +5,7 @@ import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat,
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
 import { NOTE_TYPES, AVAILABLE_NOTE_TYPES } from './constants/editorConstants';
+import type { BpmChange, EditorRuntimeState, Note, ProjectData, ProjectFormData, SelectionBox } from './types/editorTypes';
 
 export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'new' | 'import' }) {
   const [isModalOpen, setIsModalOpen] = useState(mode === 'new');
@@ -12,13 +13,12 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
   const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'curveNotes' | 'curveSC' | 'history' | 'bpmTiming'>('main');
   const [selectedNoteType, setSelectedNoteType] = useState<number>(1);
   const [noteWidth, setNoteWidth] = useState(4);
-  const [notes, setNotes] = useState<{id: number, time: number, lane: number, type: number, width: number, parentId: number | null}[]>([]);
+  const [notes, setNotes] = useState<Note[]>([]);
   const [selectedNoteIds, setSelectedNoteIds] = useState<number[]>([]);
   const [draggingNoteId, setDraggingNoteId] = useState<number | null>(null);
-  const [selectionBox, setSelectionBox] = useState<{startX: number, startY: number, endX: number, endY: number} | null>(null);
+  const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
   const nextNoteIdRef = useRef<number>(1);
-  const lastPlayedTimeRef = useRef<number>(0);
-  const [formData, setFormData] = useState({
+  const [formData, setFormData] = useState<ProjectFormData>({
     songId: '',
     songName: '',
     songArtist: '',
@@ -39,8 +39,8 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     }
   }, [formData.songIllustration]);
 
-  const [projectData, setProjectData] = useState<any>(null);
-  const [bpmChanges, setBpmChanges] = useState<{measure: number, beat: number, bpm: number, timeSignature: string}[]>([{measure: 0, beat: 0, bpm: 120, timeSignature: '4/4'}]);
+  const [projectData, setProjectData] = useState<ProjectData | null>(null);
+  const [bpmChanges, setBpmChanges] = useState<BpmChange[]>([{measure: 0, beat: 0, bpm: 120, timeSignature: '4/4'}]);
   const [offset, setOffset] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -49,18 +49,17 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
   const audioRef = useRef<HTMLAudioElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const requestRef = useRef<number>();
   const timeDisplayRef = useRef<HTMLDivElement>(null);
   const progressBarRef = useRef<HTMLInputElement>(null);
   const isDraggingProgress = useRef(false);
 
-  const stateRef = useRef({
+  const stateRef = useRef<EditorRuntimeState>({
     isPlaying: false,
     currentTime: 0,
     bpm: 120,
     bpmChanges: [{measure: 0, beat: 0, bpm: 120, timeSignature: '4/4'}],
     offset: 0,
-    notes: [] as {id: number, time: number, lane: number, type: number, width: number, parentId: number | null}[],
+    notes: [] as Note[],
   });
 
   useEffect(() => {
@@ -207,237 +206,6 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [togglePlay]);
-
-  const drawGrid = useCallback(() => {
-    const canvas = canvasRef.current;
-    const container = containerRef.current;
-    if (!canvas || !container) return;
-
-    const rect = container.getBoundingClientRect();
-    if (canvas.width !== rect.width || canvas.height !== rect.height) {
-      canvas.width = rect.width;
-      canvas.height = rect.height;
-    }
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const { width, height } = canvas;
-    ctx.clearRect(0, 0, width, height);
-
-    if (!projectData) return;
-
-    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
-
-    const activeChange = getActiveChange(stateRef.current.currentTime, sortedChanges);
-    const bpm = activeChange.bpm;
-    let time = stateRef.current.currentTime;
-    
-    if (stateRef.current.isPlaying && audioRef.current) {
-      time = audioRef.current.currentTime;
-      stateRef.current.currentTime = time;
-    }
-
-    if (timeDisplayRef.current) {
-      timeDisplayRef.current.textContent = formatTime(time, sortedChanges);
-    }
-    if (progressBarRef.current && !isDraggingProgress.current) {
-      progressBarRef.current.value = time.toString();
-    }
-
-    const currentBeat = getBeatAtTime(time, sortedChanges);
-    const pixelsPerBeat = 150;
-    const hitLineY = height - 150;
-
-    const lanes = 8;
-    const laneWidth = Math.min(60, width / (lanes + 2));
-    const gridWidth = lanes * laneWidth;
-    const startX = (width - gridWidth) / 2;
-
-    // Draw background for the grid area
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
-    ctx.fillRect(startX, 0, gridWidth, height);
-
-    // Draw lanes
-    ctx.strokeStyle = '#333';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= lanes; i++) {
-      const x = startX + i * laneWidth;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, height);
-      ctx.stroke();
-    }
-
-    // Draw beats
-    const beatsVisibleAbove = hitLineY / pixelsPerBeat;
-    const beatsVisibleBelow = (height - hitLineY) / pixelsPerBeat;
-    
-    const startBeat = Math.floor(currentBeat - beatsVisibleBelow);
-    const endBeat = Math.ceil(currentBeat + beatsVisibleAbove);
-
-    // Pre-calculate measure boundaries
-    const measureBoundaries = new Set<number>();
-    const measureNumbers = new Map<number, number>();
-    let currentMeasureBeat = 0;
-    let measureCount = 0;
-    
-    while (currentMeasureBeat <= endBeat) {
-      measureBoundaries.add(currentMeasureBeat);
-      measureNumbers.set(currentMeasureBeat, measureCount);
-      
-      const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, sortedChanges);
-      const activeChange = getActiveChange(timeAtMeasure + 0.001, sortedChanges);
-      const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
-      
-      currentMeasureBeat += beatsPerMeasure;
-      measureCount++;
-    }
-
-    // Draw beats and subdivisions
-    const subdivisions = gridZoom;
-    const step = 1 / subdivisions;
-    
-    for (let b = startBeat; b <= endBeat; b += step) {
-      if (b < 0) continue;
-      const y = hitLineY - (b - currentBeat) * pixelsPerBeat;
-      
-      const isBeatLine = Math.abs(Math.round(b) - b) < 0.001;
-      const isMeasureLine = isBeatLine && measureBoundaries.has(Math.round(b));
-
-      ctx.beginPath();
-      ctx.moveTo(startX, y);
-      ctx.lineTo(startX + gridWidth, y);
-      
-      if (isMeasureLine) {
-        ctx.strokeStyle = '#666';
-        ctx.lineWidth = 2;
-      } else if (isBeatLine) {
-        ctx.strokeStyle = '#444';
-        ctx.lineWidth = 1;
-      } else {
-        ctx.strokeStyle = '#222';
-        ctx.lineWidth = 0.5;
-      }
-      ctx.stroke();
-      
-      if (isMeasureLine) {
-        ctx.fillStyle = '#888';
-        ctx.font = '12px Inter, sans-serif';
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(`${measureNumbers.get(Math.round(b))}`, startX - 10, y);
-      }
-    }
-
-    // Draw BPM/Time Signature change indicators
-    sortedChanges.forEach(change => {
-      const changeBeat = getBeatAtTime(change.time, sortedChanges);
-      const y = hitLineY - (changeBeat - currentBeat) * pixelsPerBeat;
-      
-      // Only draw indicators that are not at time 0 (as they are implied)
-      if (change.time > 0 && y > 0 && y < height) {
-        ctx.fillStyle = '#f59e0b';
-        ctx.font = '10px Inter, sans-serif';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(`BPM: ${change.bpm} | ${change.timeSignature}`, startX + gridWidth + 10, y);
-      }
-    });
-
-    // Draw notes
-    stateRef.current.notes.forEach(note => {
-      const noteBeat = getBeatAtTime(note.time, sortedChanges);
-      const y = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
-      
-      if (y > -50 && y < height + 50) {
-        const x = startX + note.lane * laneWidth;
-        const notePixelWidth = (laneWidth / 2) * note.width;
-        
-        const noteTypeInfo = NOTE_TYPES[note.type] || NOTE_TYPES[1];
-        ctx.fillStyle = noteTypeInfo.color;
-        ctx.fillRect(x + 2, y - 10, notePixelWidth - 4, 20);
-        
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(x + 2, y - 10, notePixelWidth - 4, 20);
-
-        // Highlight if selected
-        if (selectedNoteIds.includes(note.id)) {
-          ctx.strokeStyle = '#ff00ff';
-          ctx.lineWidth = 4;
-          ctx.strokeRect(x, y - 12, notePixelWidth, 24);
-        }
-
-        // Draw note ID
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '10px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        ctx.fillText(note.id.toString(), x + notePixelWidth / 2, y + 12);
-      }
-    });
-
-    // Draw selection box
-    if (selectionBox) {
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([5, 5]);
-      ctx.strokeRect(
-        Math.min(selectionBox.startX, selectionBox.endX),
-        Math.min(selectionBox.startY, selectionBox.endY),
-        Math.abs(selectionBox.endX - selectionBox.startX),
-        Math.abs(selectionBox.endY - selectionBox.startY)
-      );
-      ctx.setLineDash([]);
-    }
-
-    // Draw hit line
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(startX, hitLineY);
-    ctx.lineTo(startX + gridWidth, hitLineY);
-    ctx.stroke();
-    
-    ctx.shadowColor = '#fff';
-    ctx.shadowBlur = 10;
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-
-  }, [projectData, gridZoom]);
-
-  const update = useCallback(() => {
-    if (stateRef.current.isPlaying && audioRef.current) {
-      const currentTime = audioRef.current.currentTime;
-      const lastTime = lastPlayedTimeRef.current;
-      
-      stateRef.current.notes.forEach(note => {
-        if (note.time > lastTime && note.time <= currentTime) {
-          const noteTypeInfo = NOTE_TYPES[note.type];
-          if (noteTypeInfo && noteTypeInfo.sound) {
-            const hitSound = new Audio(noteTypeInfo.sound);
-            hitSound.volume = 0.5;
-            hitSound.play().catch(() => {});
-          }
-        }
-      });
-      
-      lastPlayedTimeRef.current = currentTime;
-    } else {
-      lastPlayedTimeRef.current = stateRef.current.currentTime;
-    }
-
-    drawGrid();
-    requestRef.current = requestAnimationFrame(update);
-  }, [drawGrid]);
-
-  useEffect(() => {
-    requestRef.current = requestAnimationFrame(update);
-    return () => {
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
-    };
-  }, [update]);
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
