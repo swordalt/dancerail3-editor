@@ -1,5 +1,5 @@
 import React, { useEffect, useCallback } from 'react';
-import { NOTE_TYPES, HOLD_CONNECTOR_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from '../constants/editorConstants';
+import { NOTE_TYPES, HOLD_CONNECTOR_TYPES, HOLD_CENTER_TYPES, HOLD_END_TYPES, HOLD_START_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from '../constants/editorConstants';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from '../utils/editorUtils';
 import type { BpmChange, Note, ProjectData, SelectionBox, SpeedChange } from '../types/editorTypes';
 
@@ -87,7 +87,7 @@ export default function EditorCanvas({
     ctx: CanvasRenderingContext2D,
     centerX: number,
     centerY: number,
-    letter: 'S' | 'E' | '?'
+    letter: 'S' | 'C' | 'E' | '?'
   ) => {
     ctx.fillStyle = letter === '?' ? '#000000' : '#ffffff';
     ctx.font = 'bold 12px Inter, sans-serif';
@@ -300,6 +300,11 @@ export default function EditorCanvas({
         notesAtPosition.set(key, [note.id]);
       }
     });
+    const selectedParentNoteIds = new Set(
+      stateRef.current.notes
+        .filter((note) => selectedNoteIds.includes(note.id) && note.parentId !== null)
+        .map((note) => note.parentId as number),
+    );
 
     // Draw notes
     stateRef.current.notes.forEach((note) => {
@@ -363,15 +368,34 @@ export default function EditorCanvas({
           }
         }
 
+        if (HOLD_START_TYPES.includes(note.type)) {
+          drawNoteLetter(ctx, noteCenterX, y, 'S');
+        }
+
+        if (HOLD_CENTER_TYPES.includes(note.type)) {
+          drawNoteLetter(ctx, noteCenterX, y, 'C');
+        }
+
+        if (HOLD_END_TYPES.includes(note.type)) {
+          drawNoteLetter(ctx, noteCenterX, y, 'E');
+        }
+
         if (!(note.type in NOTE_TYPES)) {
           drawNoteLetter(ctx, noteCenterX, y, '?');
         }
 
         // Highlight if selected
         if (selectedNoteIds.includes(note.id)) {
+          ctx.setLineDash([]);
           ctx.strokeStyle = '#ff00ff';
           ctx.lineWidth = 4;
           ctx.strokeRect(x, y - 12, notePixelWidth, 24);
+        } else if (selectedParentNoteIds.has(note.id)) {
+          ctx.setLineDash([6, 4]);
+          ctx.strokeStyle = '#ff00ff';
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x, y - 12, notePixelWidth, 24);
+          ctx.setLineDash([]);
         }
 
         // Draw note ID

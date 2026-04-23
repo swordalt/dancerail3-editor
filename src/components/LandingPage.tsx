@@ -20,7 +20,7 @@ export default function LandingPage({
       key="landing"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
-      exit={{ opacity: 0, scale: 0.95 }}
+      exit={{ opacity: 0 }}
       transition={{ duration: 0.3 }}
       className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col items-center justify-center p-6 font-sans selection:bg-indigo-500/30"
     >
