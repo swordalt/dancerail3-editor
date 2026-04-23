@@ -1,14 +1,15 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { X } from 'lucide-react';
+import type { EditorFormData, EditorMode } from '../types/editorTypes';
 
 interface EditorModalProps {
   isOpen: boolean;
   onClose: () => void;
   onConfirm: () => void;
-  formData: any;
-  setFormData: (data: any) => void;
-  mode?: 'new' | 'import';
+  formData: EditorFormData;
+  setFormData: (data: EditorFormData) => void;
+  mode?: EditorMode;
 }
 
 export default function EditorModal({ isOpen, onClose, onConfirm, formData, setFormData, mode }: EditorModalProps) {

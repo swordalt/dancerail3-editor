@@ -1,15 +1,27 @@
 import React, { useEffect, useCallback } from 'react';
-import { NOTE_TYPES } from '../constants/editorConstants';
+import { NOTE_TYPES, HOLD_CONNECTOR_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from '../constants/editorConstants';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from '../utils/editorUtils';
+import type { BpmChange, Note, ProjectData, SelectionBox, SpeedChange } from '../types/editorTypes';
+
+interface EditorCanvasState {
+  isPlaying: boolean;
+  currentTime: number;
+  bpm: number;
+  bpmChanges: BpmChange[];
+  speedChanges: SpeedChange[];
+  offset: string | number;
+  notes: Note[];
+}
 
 interface EditorCanvasProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   containerRef: React.RefObject<HTMLDivElement | null>;
-  projectData: any;
+  projectData: ProjectData | null;
   gridZoom: number;
-  stateRef: React.MutableRefObject<any>;
+  pixelsPerBeat: number;
+  stateRef: React.MutableRefObject<EditorCanvasState>;
   selectedNoteIds: number[];
-  selectionBox: {startX: number, startY: number, endX: number, endY: number} | null;
+  selectionBox: SelectionBox | null;
   timeDisplayRef: React.RefObject<HTMLDivElement | null>;
   progressBarRef: React.RefObject<HTMLInputElement | null>;
   isDraggingProgress: React.MutableRefObject<boolean>;
@@ -22,9 +34,93 @@ interface EditorCanvasProps {
 }
 
 export default function EditorCanvas({ 
-  canvasRef, containerRef, projectData, gridZoom, stateRef, selectedNoteIds, selectionBox, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef,
+  canvasRef, containerRef, projectData, gridZoom, pixelsPerBeat, stateRef, selectedNoteIds, selectionBox, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef,
   onMouseDown, onMouseMove, onMouseUp, onMouseLeave, onContextMenu
 }: EditorCanvasProps) {
+  const drawArrow = (
+    ctx: CanvasRenderingContext2D,
+    centerX: number,
+    centerY: number,
+    direction: 'left' | 'right' | 'up' | 'down',
+    size: number
+  ) => {
+    const tail = size * 0.85;
+    const wing = size * 0.45;
+
+    ctx.beginPath();
+
+    switch (direction) {
+      case 'left':
+        ctx.moveTo(centerX + tail / 2, centerY);
+        ctx.lineTo(centerX - tail / 2, centerY);
+        ctx.lineTo(centerX - tail / 2 + wing, centerY - wing);
+        ctx.moveTo(centerX - tail / 2, centerY);
+        ctx.lineTo(centerX - tail / 2 + wing, centerY + wing);
+        break;
+      case 'right':
+        ctx.moveTo(centerX - tail / 2, centerY);
+        ctx.lineTo(centerX + tail / 2, centerY);
+        ctx.lineTo(centerX + tail / 2 - wing, centerY - wing);
+        ctx.moveTo(centerX + tail / 2, centerY);
+        ctx.lineTo(centerX + tail / 2 - wing, centerY + wing);
+        break;
+      case 'up':
+        ctx.moveTo(centerX, centerY + tail / 2);
+        ctx.lineTo(centerX, centerY - tail / 2);
+        ctx.lineTo(centerX - wing, centerY - tail / 2 + wing);
+        ctx.moveTo(centerX, centerY - tail / 2);
+        ctx.lineTo(centerX + wing, centerY - tail / 2 + wing);
+        break;
+      case 'down':
+        ctx.moveTo(centerX, centerY - tail / 2);
+        ctx.lineTo(centerX, centerY + tail / 2);
+        ctx.lineTo(centerX - wing, centerY + tail / 2 - wing);
+        ctx.moveTo(centerX, centerY + tail / 2);
+        ctx.lineTo(centerX + wing, centerY + tail / 2 - wing);
+        break;
+    }
+
+    ctx.stroke();
+  };
+
+  const drawNoteLetter = (
+    ctx: CanvasRenderingContext2D,
+    centerX: number,
+    centerY: number,
+    letter: 'S' | 'E' | '?'
+  ) => {
+    ctx.fillStyle = letter === '?' ? '#000000' : '#ffffff';
+    ctx.font = 'bold 12px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(letter, centerX, centerY);
+  };
+
+  const formatGroupedIds = (ids: number[]) => {
+    const sortedIds = [...ids].sort((a, b) => a - b);
+    const segments: string[] = [];
+    let rangeStart = sortedIds[0];
+    let previousId = sortedIds[0];
+
+    for (let index = 1; index <= sortedIds.length; index += 1) {
+      const currentId = sortedIds[index];
+      const continuesRange = currentId === previousId + 1;
+
+      if (continuesRange) {
+        previousId = currentId;
+        continue;
+      }
+
+      segments.push(
+        rangeStart === previousId ? `${rangeStart}` : `${rangeStart}-${previousId}`,
+      );
+
+      rangeStart = currentId;
+      previousId = currentId;
+    }
+
+    return segments.join(',');
+  };
   
   const drawGrid = useCallback(() => {
     const canvas = canvasRef.current;
@@ -64,7 +160,6 @@ export default function EditorCanvas({
     }
 
     const currentBeat = getBeatAtTime(time, sortedChanges);
-    const pixelsPerBeat = 150;
     const hitLineY = height - 150;
 
     const lanes = 8;
@@ -164,61 +259,113 @@ export default function EditorCanvas({
     });
 
     // Draw hold connections
-    stateRef.current.notes.forEach((note: any) => {
-      if ([3, 4, 5, 6, 7, 11].includes(note.type) && note.parentId !== null) {
-        const parentNote = stateRef.current.notes.find((n: any) => n.id === note.parentId);
-        if (parentNote && [3, 4, 5, 6, 7, 11].includes(parentNote.type)) {
+    stateRef.current.notes.forEach((note) => {
+      if (HOLD_CONNECTOR_TYPES.includes(note.type) && note.parentId !== null) {
+        const parentNote = stateRef.current.notes.find((n) => n.id === note.parentId);
+        if (parentNote) {
           const noteBeat = getBeatAtTime(note.time, sortedChanges);
           const parentBeat = getBeatAtTime(parentNote.time, sortedChanges);
           
           const y1 = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
           const y2 = hitLineY - (parentBeat - currentBeat) * pixelsPerBeat;
           
-          // Only draw if at least part of the connection is visible
-          if ((y1 > -50 && y1 < height + 50) || (y2 > -50 && y2 < height + 50) || (y1 <= -50 && y2 >= height + 50) || (y2 <= -50 && y1 >= height + 50)) {
-            const notePixelWidth = (laneWidth / 2) * note.width;
-            const parentPixelWidth = (laneWidth / 2) * parentNote.width;
-            
-            const x1_left = startX + note.lane * laneWidth + 2;
-            const x1_right = x1_left + notePixelWidth - 4;
-            const x2_left = startX + parentNote.lane * laneWidth + 2;
-            const x2_right = x2_left + parentPixelWidth - 4;
-
-            const noteTypeInfo = NOTE_TYPES[note.type] || NOTE_TYPES[1];
-            
-            ctx.fillStyle = noteTypeInfo.color + '80'; // 50% opacity
-            ctx.beginPath();
-            ctx.moveTo(x1_left, y1);
-            ctx.lineTo(x1_right, y1);
-            ctx.lineTo(x2_right, y2);
-            ctx.lineTo(x2_left, y2);
-            ctx.closePath();
-            ctx.fill();
-            
-            ctx.strokeStyle = noteTypeInfo.color;
-            ctx.lineWidth = 1;
-            ctx.stroke();
-          }
+          // Draw polygon between parent (y2) and child (y1)
+          const notePixelWidth = (laneWidth / 2) * note.width;
+          const parentPixelWidth = (laneWidth / 2) * parentNote.width;
+          
+          const x1_left = startX + note.lane * laneWidth + 2;
+          const x1_right = x1_left + notePixelWidth - 4;
+          const x2_left = startX + parentNote.lane * laneWidth + 2;
+          const x2_right = x2_left + parentPixelWidth - 4;
+          
+          ctx.fillStyle = getConnectorFill(note.type);
+          ctx.beginPath();
+          ctx.moveTo(x2_left, y2);
+          ctx.lineTo(x2_right, y2);
+          ctx.lineTo(x1_right, y1);
+          ctx.lineTo(x1_left, y1);
+          ctx.closePath();
+          ctx.fill();
         }
       }
     });
 
+    const notesAtPosition = new Map<string, number[]>();
+    stateRef.current.notes.forEach((note) => {
+      const key = `${note.time.toFixed(6)}:${note.lane}`;
+      const groupedIds = notesAtPosition.get(key);
+      if (groupedIds) {
+        groupedIds.push(note.id);
+      } else {
+        notesAtPosition.set(key, [note.id]);
+      }
+    });
+
     // Draw notes
-    stateRef.current.notes.forEach((note: any) => {
+    stateRef.current.notes.forEach((note) => {
       const noteBeat = getBeatAtTime(note.time, sortedChanges);
       const y = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       
       if (y > -50 && y < height + 50) {
         const x = startX + note.lane * laneWidth;
         const notePixelWidth = (laneWidth / 2) * note.width;
+        const noteCenterX = x + notePixelWidth / 2;
         
-        const noteTypeInfo = NOTE_TYPES[note.type] || NOTE_TYPES[1];
+        const noteTypeInfo = NOTE_TYPES[note.type] || UNKNOWN_NOTE_TYPE;
         ctx.fillStyle = noteTypeInfo.color;
-        ctx.fillRect(x + 2, y - 10, notePixelWidth - 4, 20);
-        
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(x + 2, y - 10, notePixelWidth - 4, 20);
+        // Draw note
+        if (note.type === 9) {
+          // Circle flick: solid center with an outer ring so it reads as distinct in the editor.
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(noteCenterX, y, 14, 0, 2 * Math.PI);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(noteCenterX, y, 9, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+        } else {
+          ctx.fillRect(x + 2, y - 10, notePixelWidth - 4, 20);
+          
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x + 2, y - 10, notePixelWidth - 4, 20);
+        }
+
+        if ([9, 13, 14, 15, 16].includes(note.type)) {
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+
+          if (note.type === 9) {
+            drawArrow(ctx, noteCenterX - 11, y, 'left', 8);
+            drawArrow(ctx, noteCenterX + 11, y, 'right', 8);
+          }
+
+          if (note.type === 13) {
+            drawArrow(ctx, noteCenterX, y, 'left', 12);
+          }
+
+          if (note.type === 14) {
+            drawArrow(ctx, noteCenterX, y, 'right', 12);
+          }
+
+          if (note.type === 15) {
+            drawArrow(ctx, noteCenterX, y, 'up', 12);
+          }
+
+          if (note.type === 16) {
+            drawArrow(ctx, noteCenterX, y, 'down', 12);
+          }
+        }
+
+        if (!(note.type in NOTE_TYPES)) {
+          drawNoteLetter(ctx, noteCenterX, y, '?');
+        }
 
         // Highlight if selected
         if (selectedNoteIds.includes(note.id)) {
@@ -232,7 +379,8 @@ export default function EditorCanvas({
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        ctx.fillText(note.id.toString(), x + notePixelWidth / 2, y + 12);
+        const groupedIds = notesAtPosition.get(`${note.time.toFixed(6)}:${note.lane}`) || [note.id];
+        ctx.fillText(formatGroupedIds(groupedIds), x + notePixelWidth / 2, y + 12);
       }
     });
 
@@ -263,7 +411,7 @@ export default function EditorCanvas({
     ctx.stroke();
     ctx.shadowBlur = 0;
 
-  }, [projectData, gridZoom, selectedNoteIds, selectionBox, canvasRef, containerRef, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef]);
+  }, [pixelsPerBeat, projectData, gridZoom, selectedNoteIds, selectionBox, canvasRef, containerRef, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef]);
 
   useEffect(() => {
     drawGrid();

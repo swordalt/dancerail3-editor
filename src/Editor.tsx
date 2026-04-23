@@ -1,24 +1,82 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
-import { ArrowLeft, Settings, Play, Pause, Save, X, Upload } from 'lucide-react';
+import { motion } from 'motion/react';
+import { ArrowLeft, Settings, Play, Pause, Save, X, ChevronLeft, ChevronRight } from 'lucide-react';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from './utils/editorUtils';
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
-import { NOTE_TYPES, AVAILABLE_NOTE_TYPES } from './constants/editorConstants';
+import { NOTE_TYPES, AVAILABLE_NOTE_TYPES, HOLD_CONNECTOR_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from './constants/editorConstants';
+import type { BpmChange, EditorFormData, EditorMode, Note, ProjectData, SelectionBox, SpeedChange } from './types/editorTypes';
+import { buildLevelText } from './utils/levelFormat';
 
-export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'new' | 'import' }) {
+const HIT_SOUND_URL = new URL('../hit.ogg', import.meta.url).href;
+const FLICK_SOUND_URL = new URL('../flick.ogg', import.meta.url).href;
+const SOUND_URLS: Record<string, string> = {
+  'hit.ogg': HIT_SOUND_URL,
+  'flick.ogg': FLICK_SOUND_URL,
+};
+const HIT_SOUND_VOLUME = 0.5;
+const HIT_SOUND_LOOKAHEAD_SECONDS = 0.05;
+
+interface EditorProps {
+  onBack: () => void;
+  mode?: EditorMode;
+  notes: Note[];
+  setNotes: React.Dispatch<React.SetStateAction<Note[]>>;
+  bpmChanges: BpmChange[];
+  setBpmChanges: React.Dispatch<React.SetStateAction<BpmChange[]>>;
+  speedChanges: SpeedChange[];
+  setSpeedChanges: React.Dispatch<React.SetStateAction<SpeedChange[]>>;
+  offset: string | number;
+  setOffset: React.Dispatch<React.SetStateAction<string | number>>;
+}
+
+interface EditorRuntimeState {
+  isPlaying: boolean;
+  currentTime: number;
+  bpm: number;
+  bpmChanges: BpmChange[];
+  speedChanges: SpeedChange[];
+  offset: string | number;
+  notes: Note[];
+}
+
+interface HoverPreview {
+  lane: number;
+  time: number;
+}
+
+export default function Editor({ 
+  onBack, 
+  mode,
+  notes,
+  setNotes,
+  bpmChanges,
+  setBpmChanges,
+  speedChanges,
+  setSpeedChanges,
+  offset,
+  setOffset
+}: EditorProps) {
+  const DEFAULT_PIXELS_PER_BEAT = 150;
+  const MIN_PIXELS_PER_BEAT = 60;
+  const MAX_PIXELS_PER_BEAT = 320;
   const [isModalOpen, setIsModalOpen] = useState(mode === 'new');
   const [gridZoom, setGridZoom] = useState(1);
-  const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'curveNotes' | 'curveSC' | 'history' | 'bpmTiming'>('main');
+  const [pixelsPerBeat, setPixelsPerBeat] = useState(DEFAULT_PIXELS_PER_BEAT);
+  const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'speedChanges' | 'curveSC' | 'history' | 'bpmTiming'>('main');
+  const [isLeftPanelCompact, setIsLeftPanelCompact] = useState(false);
+  const [isRightPanelCompact, setIsRightPanelCompact] = useState(false);
   const [selectedNoteType, setSelectedNoteType] = useState<number>(1);
   const [noteWidth, setNoteWidth] = useState(4);
-  const [notes, setNotes] = useState<{id: number, time: number, lane: number, type: number, width: number, parentId: number | null}[]>([]);
+  const [currentParentInput, setCurrentParentInput] = useState('');
+  const [hoverPreview, setHoverPreview] = useState<HoverPreview | null>(null);
+  const [isCtrlHeld, setIsCtrlHeld] = useState(false);
   const [selectedNoteIds, setSelectedNoteIds] = useState<number[]>([]);
   const [draggingNoteId, setDraggingNoteId] = useState<number | null>(null);
-  const [selectionBox, setSelectionBox] = useState<{startX: number, startY: number, endX: number, endY: number} | null>(null);
+  const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
   const nextNoteIdRef = useRef<number>(1);
   const lastPlayedTimeRef = useRef<number>(0);
-  const [formData, setFormData] = useState({
+  const [formData, setFormData] = useState<EditorFormData>({
     songId: '',
     songName: '',
     songArtist: '',
@@ -39,28 +97,36 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     }
   }, [formData.songIllustration]);
 
-  const [projectData, setProjectData] = useState<any>(null);
-  const [bpmChanges, setBpmChanges] = useState<{measure: number, beat: number, bpm: number, timeSignature: string}[]>([{measure: 0, beat: 0, bpm: 120, timeSignature: '4/4'}]);
-  const [offset, setOffset] = useState(0);
+  const [projectData, setProjectData] = useState<ProjectData | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [fps, setFps] = useState(0);
+  const [renderedObjects, setRenderedObjects] = useState(0);
   
   const audioRef = useRef<HTMLAudioElement>(null);
+  const hitSoundContextRef = useRef<AudioContext | null>(null);
+  const hitSoundBuffersRef = useRef<Map<string, AudioBuffer>>(new Map());
+  const hitSoundLoadPromisesRef = useRef<Map<string, Promise<AudioBuffer | null>>>(new Map());
+  const activeHitSounds = useRef<Set<AudioBufferSourceNode>>(new Set());
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const requestRef = useRef<number>();
+  const fpsFrameCountRef = useRef(0);
+  const fpsWindowStartRef = useRef(performance.now());
+  const renderedObjectsRef = useRef(0);
   const timeDisplayRef = useRef<HTMLDivElement>(null);
   const progressBarRef = useRef<HTMLInputElement>(null);
   const isDraggingProgress = useRef(false);
 
-  const stateRef = useRef({
+  const stateRef = useRef<EditorRuntimeState>({
     isPlaying: false,
     currentTime: 0,
     bpm: 120,
-    bpmChanges: [{measure: 0, beat: 0, bpm: 120, timeSignature: '4/4'}],
+    bpmChanges: [{ measure: 0, beat: 0, bpm: 120, timeSignature: '4/4' }],
+    speedChanges: [{ measure: 0, beat: 0, speedChange: 1 }],
     offset: 0,
-    notes: [] as {id: number, time: number, lane: number, type: number, width: number, parentId: number | null}[],
+    notes: [],
   });
 
   useEffect(() => {
@@ -70,13 +136,31 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     stateRef.current.bpmChanges = bpmChanges;
     stateRef.current.offset = offset;
     stateRef.current.notes = notes;
-  }, [isPlaying, currentTime, projectData, bpmChanges, offset, notes]);
+    stateRef.current.speedChanges = speedChanges;
+  }, [isPlaying, currentTime, projectData, bpmChanges, offset, notes, speedChanges]);
+
+  useEffect(() => {
+    if (draggingNoteId || selectionBox) {
+      setHoverPreview(null);
+    }
+  }, [draggingNoteId, selectionBox]);
+
+  useEffect(() => {
+    if (isCtrlHeld) {
+      setHoverPreview(null);
+    }
+  }, [isCtrlHeld]);
 
   useEffect(() => {
     if (mode === 'new') {
       setIsModalOpen(true);
     }
   }, [mode]);
+
+  useEffect(() => {
+    const maxNoteId = notes.reduce((maxId, note) => Math.max(maxId, note.id), 0);
+    nextNoteIdRef.current = maxNoteId + 1;
+  }, [notes]);
 
   useEffect(() => {
     const handleMouseUp = () => {
@@ -92,13 +176,22 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       if (audioUrl) URL.revokeObjectURL(audioUrl);
       audioUrl = URL.createObjectURL(formData.songFile);
     }
-    const initialBpm = parseFloat(formData.songBpm) || 120;
+    const parsedBpm = parseFloat(formData.songBpm);
+    const fallbackBpm = projectData?.bpm || bpmChanges[0]?.bpm || 120;
+    const nextBpm = Number.isFinite(parsedBpm) ? parsedBpm : fallbackBpm;
+
     setProjectData({
       ...formData,
-      bpm: initialBpm,
+      songBpm: nextBpm.toString(),
+      bpm: nextBpm,
       audioUrl
     });
-    setBpmChanges([{measure: 0, beat: 0, bpm: initialBpm, timeSignature: '4/4'}]);
+
+    // Only initialize timing data when creating a fresh project.
+    if (!projectData) {
+      setBpmChanges([{ measure: 0, beat: 0, bpm: nextBpm, timeSignature: '4/4' }]);
+    }
+
     setIsModalOpen(false);
     if (activeLeftPanel === 'editInfo') {
       setActiveLeftPanel('main');
@@ -106,57 +199,196 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
   };
 
   const handleEditInfo = () => {
-    if (projectData) {
-      setFormData({
-        songId: projectData.songId,
-        songName: projectData.songName,
-        songArtist: projectData.songArtist,
-        songBpm: projectData.bpm.toString(),
-        difficulty: projectData.difficulty,
-        songFile: projectData.songFile,
-        songIllustration: projectData.songIllustration,
-      });
-      setActiveLeftPanel('editInfo');
-    }
+    setFormData({
+      songId: projectData?.songId || '',
+      songName: projectData?.songName || '',
+      songArtist: projectData?.songArtist || '',
+      songBpm: projectData?.bpm?.toString() || '',
+      difficulty: projectData?.difficulty || '1',
+      songFile: projectData?.songFile || null,
+      songIllustration: projectData?.songIllustration || null,
+    });
+    setActiveLeftPanel('editInfo');
   };
 
+  const getHitSoundContext = useCallback(() => {
+    if (hitSoundContextRef.current) return hitSoundContextRef.current;
+
+    const AudioContextCtor =
+      window.AudioContext ||
+      (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+    if (!AudioContextCtor) return null;
+
+    const context = new AudioContextCtor({ latencyHint: 'interactive' });
+    hitSoundContextRef.current = context;
+    return context;
+  }, []);
+
+  const loadHitSoundBuffer = useCallback(async (soundUrl: string) => {
+    const cachedBuffer = hitSoundBuffersRef.current.get(soundUrl);
+    if (cachedBuffer) return cachedBuffer;
+
+    const existingLoad = hitSoundLoadPromisesRef.current.get(soundUrl);
+    if (existingLoad) return existingLoad;
+
+    const loadPromise = (async () => {
+      const context = getHitSoundContext();
+      if (!context) return null;
+
+      try {
+        const response = await fetch(soundUrl);
+        const audioData = await response.arrayBuffer();
+        const buffer = await context.decodeAudioData(audioData);
+        hitSoundBuffersRef.current.set(soundUrl, buffer);
+        return buffer;
+      } catch (error) {
+        console.warn('Failed to load hitsound:', soundUrl, error);
+        return null;
+      } finally {
+        hitSoundLoadPromisesRef.current.delete(soundUrl);
+      }
+    })();
+
+    hitSoundLoadPromisesRef.current.set(soundUrl, loadPromise);
+    return loadPromise;
+  }, [getHitSoundContext]);
+
+  const playHitSound = useCallback((soundUrl: string, delaySeconds = 0) => {
+    const context = getHitSoundContext();
+    const buffer = hitSoundBuffersRef.current.get(soundUrl);
+    if (!context || !buffer) {
+      void loadHitSoundBuffer(soundUrl);
+      return;
+    }
+
+    const source = context.createBufferSource();
+    const gain = context.createGain();
+    gain.gain.value = HIT_SOUND_VOLUME;
+    source.buffer = buffer;
+    source.connect(gain);
+    gain.connect(context.destination);
+
+    activeHitSounds.current.add(source);
+    source.onended = () => {
+      activeHitSounds.current.delete(source);
+      source.disconnect();
+      gain.disconnect();
+    };
+
+    source.start(context.currentTime + Math.max(0, delaySeconds));
+  }, [getHitSoundContext, loadHitSoundBuffer]);
+
+  useEffect(() => {
+    Object.values(SOUND_URLS).forEach(soundUrl => {
+      void loadHitSoundBuffer(soundUrl);
+    });
+
+    return () => {
+      activeHitSounds.current.forEach(source => {
+        try {
+          source.stop();
+        } catch {
+          // Source may have already ended.
+        }
+      });
+      activeHitSounds.current.clear();
+      hitSoundContextRef.current?.close().catch(() => {});
+      hitSoundContextRef.current = null;
+    };
+  }, [loadHitSoundBuffer]);
+
   const handleSeekChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const newTime = parseFloat(e.target.value);
+    stopHitsounds();
+    const targetTime = parseFloat(e.target.value);
+
+    // Snap to grid
+    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+    const targetBeat = getBeatAtTime(targetTime, sortedChanges);
+    const snappedBeat = Math.round(targetBeat * gridZoom) / gridZoom;
+    const newTime = getTimeAtBeat(snappedBeat, sortedChanges);
+    
     setCurrentTime(newTime);
     stateRef.current.currentTime = newTime;
+    lastPlayedTimeRef.current = newTime;
+    
+    const offsetInSeconds = parseFloat(offset.toString()) / 1000;
     if (audioRef.current) {
-      audioRef.current.currentTime = newTime;
+      audioRef.current.currentTime = Math.max(0, newTime - offsetInSeconds);
     }
     if (timeDisplayRef.current && projectData) {
-      timeDisplayRef.current.textContent = formatTime(newTime, convertBpmChangesToTime(stateRef.current.bpmChanges));
+      timeDisplayRef.current.textContent = formatTime(newTime, sortedChanges);
     }
-  }, [projectData]);
+  }, [projectData, offset, gridZoom]);
+
+  const stopHitsounds = () => {
+    activeHitSounds.current.forEach(source => {
+      try {
+        source.stop();
+      } catch {
+        // Source may have already ended.
+      }
+    });
+    activeHitSounds.current.clear();
+  };
 
   const togglePlay = useCallback(() => {
     if (!audioRef.current || !projectData) return;
+    const offsetInSeconds = parseFloat(offset.toString()) / 1000;
+    
     if (stateRef.current.isPlaying) {
+      stopHitsounds();
       audioRef.current.pause();
+      // Clear any pending timeout if they were about to play
+      if (window.hasOwnProperty('playTimeout')) {
+        clearTimeout((window as any).playTimeout);
+      }
       setIsPlaying(false);
       
+      console.log('Paused, audioTime:', audioRef.current.currentTime);
+      
       // Snap to nearest beat
-      const bpm = stateRef.current.bpm;
-      const currentBeat = audioRef.current.currentTime * (bpm / 60);
+      const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+      const activeChange = getActiveChange(audioRef.current.currentTime + offsetInSeconds, sortedChanges);
+      const bpm = activeChange.bpm;
+      
+      const currentBeat = (audioRef.current.currentTime + Math.max(0, offsetInSeconds)) * (bpm / 60);
       const snappedBeat = Math.round(currentBeat);
-      const snappedTime = snappedBeat * (60 / bpm);
+      const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
       
       setCurrentTime(snappedTime);
       stateRef.current.currentTime = snappedTime;
-      audioRef.current.currentTime = snappedTime;
+      audioRef.current.currentTime = Math.max(0, snappedTime - offsetInSeconds);
     } else {
-      audioRef.current.currentTime = stateRef.current.currentTime;
-      audioRef.current.play();
+      const hitSoundContext = getHitSoundContext();
+      if (hitSoundContext?.state === 'suspended') {
+        hitSoundContext.resume().catch(() => {});
+      }
+
+      // Apply offset here. If delay (offset > 0), wait. If advance (offset < 0), seek.
+      if (offsetInSeconds > 0) {
+        // Delay music: Editor starts at current time, Music starts playing after offsetInSeconds past audio seek point
+        audioRef.current.currentTime = Math.max(0, stateRef.current.currentTime - offsetInSeconds);
+        (window as any).playTimeout = setTimeout(() => {
+            if (audioRef.current) audioRef.current.play();
+        }, offsetInSeconds * 1000);
+      } else {
+        // Advance music: Start music early
+        audioRef.current.currentTime = Math.max(0, stateRef.current.currentTime - offsetInSeconds);
+        audioRef.current.play();
+      }
+      
       setIsPlaying(true);
     }
-  }, [projectData]);
+  }, [getHitSoundContext, projectData, offset]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
+
+      if (e.key === 'Control') {
+        setIsCtrlHeld(true);
+      }
       
       if (e.code === 'Space') {
         e.preventDefault();
@@ -175,6 +407,14 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
           if (prev <= 4) return 1;
           return prev - 4;
         });
+      }
+
+      if (e.key.toLowerCase() === 'r') {
+        setPixelsPerBeat(prev => Math.min(MAX_PIXELS_PER_BEAT, prev + 20));
+      }
+
+      if (e.key.toLowerCase() === 'f') {
+        setPixelsPerBeat(prev => Math.max(MIN_PIXELS_PER_BEAT, prev - 20));
       }
 
       if (e.key.toLowerCase() === 'a') {
@@ -204,8 +444,26 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         setSelectedNoteIds([]);
       }
     };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Control') {
+        setIsCtrlHeld(false);
+      }
+    };
+
+    const handleWindowBlur = () => {
+      setIsCtrlHeld(false);
+      setHoverPreview(null);
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleWindowBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleWindowBlur);
+    };
   }, [togglePlay]);
 
   const drawGrid = useCallback(() => {
@@ -224,17 +482,127 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
 
     const { width, height } = canvas;
     ctx.clearRect(0, 0, width, height);
+    let objectCount = 0;
+
+    const drawInvertedTriangle = (
+      centerX: number,
+      centerY: number,
+      sideLength: number,
+    ) => {
+      const triangleHeight = (Math.sqrt(3) / 2) * sideLength;
+
+      ctx.beginPath();
+      ctx.moveTo(centerX - sideLength / 2, centerY - triangleHeight / 2);
+      ctx.lineTo(centerX + sideLength / 2, centerY - triangleHeight / 2);
+      ctx.lineTo(centerX, centerY + triangleHeight / 2);
+      ctx.closePath();
+      ctx.fill();
+    };
+
+    const drawCircleMark = (
+      centerX: number,
+      centerY: number,
+      radius: number,
+    ) => {
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
+      ctx.stroke();
+    };
+
+    const drawArrow = (
+      centerX: number,
+      centerY: number,
+      direction: 'left' | 'right' | 'up' | 'down',
+      size: number,
+    ) => {
+      const tail = size * 0.85;
+      const wing = size * 0.45;
+
+      ctx.beginPath();
+
+      switch (direction) {
+        case 'left':
+          ctx.moveTo(centerX + tail / 2, centerY);
+          ctx.lineTo(centerX - tail / 2, centerY);
+          ctx.lineTo(centerX - tail / 2 + wing, centerY - wing);
+          ctx.moveTo(centerX - tail / 2, centerY);
+          ctx.lineTo(centerX - tail / 2 + wing, centerY + wing);
+          break;
+        case 'right':
+          ctx.moveTo(centerX - tail / 2, centerY);
+          ctx.lineTo(centerX + tail / 2, centerY);
+          ctx.lineTo(centerX + tail / 2 - wing, centerY - wing);
+          ctx.moveTo(centerX + tail / 2, centerY);
+          ctx.lineTo(centerX + tail / 2 - wing, centerY + wing);
+          break;
+        case 'up':
+          ctx.moveTo(centerX, centerY + tail / 2);
+          ctx.lineTo(centerX, centerY - tail / 2);
+          ctx.lineTo(centerX - wing, centerY - tail / 2 + wing);
+          ctx.moveTo(centerX, centerY - tail / 2);
+          ctx.lineTo(centerX + wing, centerY - tail / 2 + wing);
+          break;
+        case 'down':
+          ctx.moveTo(centerX, centerY - tail / 2);
+          ctx.lineTo(centerX, centerY + tail / 2);
+          ctx.lineTo(centerX - wing, centerY + tail / 2 - wing);
+          ctx.moveTo(centerX, centerY + tail / 2);
+          ctx.lineTo(centerX + wing, centerY + tail / 2 - wing);
+          break;
+      }
+
+      ctx.stroke();
+    };
+
+    const drawNoteLetter = (
+      centerX: number,
+      centerY: number,
+      letter: 'S' | 'E' | '?',
+    ) => {
+      ctx.fillStyle = letter === '?' ? '#000000' : '#ffffff';
+      ctx.font = 'bold 12px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(letter, centerX, centerY);
+    };
+
+    const formatGroupedIds = (ids: number[]) => {
+      const sortedIds = [...ids].sort((a, b) => a - b);
+      const segments: string[] = [];
+      let rangeStart = sortedIds[0];
+      let previousId = sortedIds[0];
+
+      for (let index = 1; index <= sortedIds.length; index += 1) {
+        const currentId = sortedIds[index];
+        const continuesRange = currentId === previousId + 1;
+
+        if (continuesRange) {
+          previousId = currentId;
+          continue;
+        }
+
+        segments.push(
+          rangeStart === previousId ? `${rangeStart}` : `${rangeStart}-${previousId}`,
+        );
+
+        rangeStart = currentId;
+        previousId = currentId;
+      }
+
+      return segments.join(',');
+    };
 
     if (!projectData) return;
 
     const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+    const offsetInSeconds = parseFloat(offset.toString()) / 1000;
 
     const activeChange = getActiveChange(stateRef.current.currentTime, sortedChanges);
     const bpm = activeChange.bpm;
     let time = stateRef.current.currentTime;
     
     if (stateRef.current.isPlaying && audioRef.current) {
-      time = audioRef.current.currentTime;
+      time = audioRef.current.currentTime + offsetInSeconds;
       stateRef.current.currentTime = time;
     }
 
@@ -246,7 +614,6 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     }
 
     const currentBeat = getBeatAtTime(time, sortedChanges);
-    const pixelsPerBeat = 150;
     const hitLineY = height - 150;
 
     const lanes = 8;
@@ -267,6 +634,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       ctx.moveTo(x, 0);
       ctx.lineTo(x, height);
       ctx.stroke();
+      objectCount += 1;
     }
 
     // Draw beats
@@ -320,6 +688,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         ctx.lineWidth = 0.5;
       }
       ctx.stroke();
+      objectCount += 1;
       
       if (isMeasureLine) {
         ctx.fillStyle = '#888';
@@ -327,6 +696,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         ctx.textAlign = 'right';
         ctx.textBaseline = 'middle';
         ctx.fillText(`${measureNumbers.get(Math.round(b))}`, startX - 10, y);
+        objectCount += 1;
       }
     }
 
@@ -342,6 +712,68 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
         ctx.fillText(`BPM: ${change.bpm} | ${change.timeSignature}`, startX + gridWidth + 10, y);
+        objectCount += 1;
+      }
+    });
+
+    // Draw Speed change indicators
+    stateRef.current.speedChanges.forEach(sc => {
+      // Approximation: assuming 4 beats per measure for SC indicator position
+      const scBeat = sc.measure * 4 + sc.beat;
+      const y = hitLineY - (scBeat - currentBeat) * pixelsPerBeat;
+      
+      if (y > 0 && y < height) {
+        ctx.fillStyle = '#06b6d4'; // teal-500
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`SC: ${sc.speedChange.toFixed(1)}x`, startX - 10, y);
+        objectCount += 1;
+      }
+    });
+
+    // Draw hold connections before note bodies so linked notes render on top.
+    stateRef.current.notes.forEach(note => {
+      if (!HOLD_CONNECTOR_TYPES.includes(note.type) || note.parentId === null) {
+        return;
+      }
+
+      const parentNote = stateRef.current.notes.find(n => n.id === note.parentId);
+      if (!parentNote) {
+        return;
+      }
+
+      const noteBeat = getBeatAtTime(note.time, sortedChanges);
+      const parentBeat = getBeatAtTime(parentNote.time, sortedChanges);
+      const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
+      const parentY = hitLineY - (parentBeat - currentBeat) * pixelsPerBeat;
+
+      const noteWidthPx = (laneWidth / 2) * note.width;
+      const parentWidthPx = (laneWidth / 2) * parentNote.width;
+      const noteLeftX = startX + note.lane * laneWidth + 2;
+      const noteRightX = noteLeftX + noteWidthPx - 4;
+      const parentLeftX = startX + parentNote.lane * laneWidth + 2;
+      const parentRightX = parentLeftX + parentWidthPx - 4;
+
+      ctx.fillStyle = getConnectorFill(note.type);
+      ctx.beginPath();
+      ctx.moveTo(parentLeftX, parentY);
+      ctx.lineTo(parentRightX, parentY);
+      ctx.lineTo(noteRightX, noteY);
+      ctx.lineTo(noteLeftX, noteY);
+      ctx.closePath();
+      ctx.fill();
+      objectCount += 1;
+    });
+
+    const notesAtPosition = new Map<string, number[]>();
+    stateRef.current.notes.forEach((note) => {
+      const key = `${note.time.toFixed(6)}:${note.lane}`;
+      const groupedIds = notesAtPosition.get(key);
+      if (groupedIds) {
+        groupedIds.push(note.id);
+      } else {
+        notesAtPosition.set(key, [note.id]);
       }
     });
 
@@ -353,14 +785,59 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       if (y > -50 && y < height + 50) {
         const x = startX + note.lane * laneWidth;
         const notePixelWidth = (laneWidth / 2) * note.width;
+        const noteCenterX = x + notePixelWidth / 2;
         
-        const noteTypeInfo = NOTE_TYPES[note.type] || NOTE_TYPES[1];
+        const noteTypeInfo = NOTE_TYPES[note.type] || UNKNOWN_NOTE_TYPE;
         ctx.fillStyle = noteTypeInfo.color;
         ctx.fillRect(x + 2, y - 10, notePixelWidth - 4, 20);
         
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = 2;
         ctx.strokeRect(x + 2, y - 10, notePixelWidth - 4, 20);
+
+        if (note.type === 1 || note.type === 2) {
+          ctx.fillStyle = '#ffffff';
+          drawInvertedTriangle(x + notePixelWidth / 2, y, Math.min(notePixelWidth - 12, 12));
+        }
+
+        if (note.type === 9) {
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+          drawCircleMark(noteCenterX, y, Math.min((notePixelWidth - 12) / 2, 6));
+        }
+
+        if ([3, 5, 10].includes(note.type)) {
+          drawNoteLetter(noteCenterX, y, 'S');
+        }
+
+        if ([4, 7, 18].includes(note.type)) {
+          drawNoteLetter(noteCenterX, y, 'E');
+        }
+
+        if (!(note.type in NOTE_TYPES)) {
+          drawNoteLetter(noteCenterX, y, '?');
+        }
+
+        if ([13, 14, 15, 16].includes(note.type)) {
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+
+          if (note.type === 13) {
+            drawArrow(noteCenterX, y, 'left', 10);
+          }
+
+          if (note.type === 14) {
+            drawArrow(noteCenterX, y, 'right', 10);
+          }
+
+          if (note.type === 15) {
+            drawArrow(noteCenterX, y, 'up', 10);
+          }
+
+          if (note.type === 16) {
+            drawArrow(noteCenterX, y, 'down', 10);
+          }
+        }
 
         // Highlight if selected
         if (selectedNoteIds.includes(note.id)) {
@@ -374,9 +851,86 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        ctx.fillText(note.id.toString(), x + notePixelWidth / 2, y + 12);
+        const groupedIds = notesAtPosition.get(`${note.time.toFixed(6)}:${note.lane}`) || [note.id];
+        ctx.fillText(formatGroupedIds(groupedIds), x + notePixelWidth / 2, y + 12);
+        objectCount += 1;
       }
     });
+
+    if (hoverPreview && !isCtrlHeld) {
+      const previewBeat = getBeatAtTime(hoverPreview.time, sortedChanges);
+      const previewY = hitLineY - (previewBeat - currentBeat) * pixelsPerBeat;
+
+      if (previewY > -50 && previewY < height + 50) {
+        const previewX = startX + hoverPreview.lane * laneWidth;
+        const previewPixelWidth = (laneWidth / 2) * noteWidth;
+        const previewCenterX = previewX + previewPixelWidth / 2;
+        const previewTypeInfo = NOTE_TYPES[selectedNoteType] || UNKNOWN_NOTE_TYPE;
+        const pulse = (Math.sin(performance.now() / 220) + 1) / 2;
+        const fillAlpha = 0.12 + pulse * 0.12;
+        const outlineAlpha = 0.35 + pulse * 0.35;
+
+        ctx.save();
+        ctx.globalAlpha = fillAlpha;
+        ctx.fillStyle = previewTypeInfo.color;
+        ctx.fillRect(previewX + 2, previewY - 10, previewPixelWidth - 4, 20);
+        if (selectedNoteType === 1 || selectedNoteType === 2) {
+          ctx.fillStyle = '#ffffff';
+          drawInvertedTriangle(
+            previewCenterX,
+            previewY,
+            Math.min(previewPixelWidth - 12, 12),
+          );
+        }
+        if (selectedNoteType === 9) {
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+          drawCircleMark(
+            previewCenterX,
+            previewY,
+            Math.min((previewPixelWidth - 12) / 2, 6),
+          );
+        }
+        if ([3, 5, 10].includes(selectedNoteType)) {
+          drawNoteLetter(previewCenterX, previewY, 'S');
+        }
+        if ([4, 7, 18].includes(selectedNoteType)) {
+          drawNoteLetter(previewCenterX, previewY, 'E');
+        }
+        if (!(selectedNoteType in NOTE_TYPES)) {
+          drawNoteLetter(previewCenterX, previewY, '?');
+        }
+        if ([13, 14, 15, 16].includes(selectedNoteType)) {
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+
+          if (selectedNoteType === 13) {
+            drawArrow(previewCenterX, previewY, 'left', 10);
+          }
+
+          if (selectedNoteType === 14) {
+            drawArrow(previewCenterX, previewY, 'right', 10);
+          }
+
+          if (selectedNoteType === 15) {
+            drawArrow(previewCenterX, previewY, 'up', 10);
+          }
+
+          if (selectedNoteType === 16) {
+            drawArrow(previewCenterX, previewY, 'down', 10);
+          }
+        }
+        ctx.globalAlpha = outlineAlpha;
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(previewX + 2, previewY - 10, previewPixelWidth - 4, 20);
+        ctx.setLineDash([6, 4]);
+        ctx.strokeStyle = '#ffffff';
+        ctx.strokeRect(previewX, previewY - 12, previewPixelWidth, 24);
+        ctx.restore();
+        objectCount += 1;
+      }
+    }
 
     // Draw selection box
     if (selectionBox) {
@@ -390,6 +944,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         Math.abs(selectionBox.endY - selectionBox.startY)
       );
       ctx.setLineDash([]);
+      objectCount += 1;
     }
 
     // Draw hit line
@@ -404,33 +959,51 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     ctx.shadowBlur = 10;
     ctx.stroke();
     ctx.shadowBlur = 0;
+    objectCount += 1;
+    renderedObjectsRef.current = objectCount;
 
-  }, [projectData, gridZoom]);
+  }, [pixelsPerBeat, projectData, gridZoom, hoverPreview, isCtrlHeld, noteWidth, selectedNoteIds, selectedNoteType, selectionBox]);
 
   const update = useCallback(() => {
+    const now = performance.now();
+    fpsFrameCountRef.current += 1;
+    const elapsed = now - fpsWindowStartRef.current;
+    if (elapsed >= 500) {
+      setFps(Math.round((fpsFrameCountRef.current * 1000) / elapsed));
+      fpsFrameCountRef.current = 0;
+      fpsWindowStartRef.current = now;
+      setRenderedObjects(renderedObjectsRef.current);
+    }
+
     if (stateRef.current.isPlaying && audioRef.current) {
-      const currentTime = audioRef.current.currentTime;
+      const offsetInSeconds = parseFloat(offset.toString()) / 1000;
+      const currentTime = audioRef.current.currentTime + offsetInSeconds;
+      const scheduleUntil = currentTime + HIT_SOUND_LOOKAHEAD_SECONDS;
       const lastTime = lastPlayedTimeRef.current;
       
+      const notesPlayedAtTime = new Set<string>();
       stateRef.current.notes.forEach(note => {
-        if (note.time > lastTime && note.time <= currentTime) {
+        if (note.time > lastTime && note.time <= scheduleUntil) {
           const noteTypeInfo = NOTE_TYPES[note.type];
           if (noteTypeInfo && noteTypeInfo.sound) {
-            const hitSound = new Audio(noteTypeInfo.sound);
-            hitSound.volume = 0.5;
-            hitSound.play().catch(() => {});
+            const soundUrl = SOUND_URLS[noteTypeInfo.sound] || noteTypeInfo.sound;
+            const soundKey = `${note.time}-${note.type}`;
+            if (!notesPlayedAtTime.has(soundKey)) {
+              notesPlayedAtTime.add(soundKey);
+              playHitSound(soundUrl, note.time - currentTime);
+            }
           }
         }
       });
       
-      lastPlayedTimeRef.current = currentTime;
+      lastPlayedTimeRef.current = scheduleUntil;
     } else {
       lastPlayedTimeRef.current = stateRef.current.currentTime;
     }
 
     drawGrid();
     requestRef.current = requestAnimationFrame(update);
-  }, [drawGrid]);
+  }, [drawGrid, offset, playHitSound]); // Added offset to dependencies
 
   useEffect(() => {
     requestRef.current = requestAnimationFrame(update);
@@ -453,7 +1026,6 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     const gridWidth = lanes * laneWidth;
     const startX = (width - gridWidth) / 2;
 
-    const pixelsPerBeat = 150;
     const hitLineY = height - 150;
     
     const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
@@ -469,28 +1041,43 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     
     const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
 
-    const clickedNote = [...stateRef.current.notes].reverse().find(n => {
-      const noteBeat = getBeatAtTime(n.time, sortedChanges);
+    const clickedNote = stateRef.current.notes.reduce<Note | null>((highestNote, note) => {
+      const noteBeat = getBeatAtTime(note.time, sortedChanges);
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
-      const noteStartX = startX + n.lane * laneWidth;
-      const noteEndX = noteStartX + (laneWidth / 2) * n.width;
-      
-      return clickX >= noteStartX && clickX <= noteEndX && clickY >= noteY - 10 && clickY <= noteY + 10;
-    });
+      const noteStartX = startX + note.lane * laneWidth;
+      const noteEndX = noteStartX + (laneWidth / 2) * note.width;
+      const isHit = clickX >= noteStartX && clickX <= noteEndX && clickY >= noteY - 10 && clickY <= noteY + 10;
+
+      if (!isHit) {
+        return highestNote;
+      }
+
+      if (!highestNote || note.id > highestNote.id) {
+        return note;
+      }
+
+      return highestNote;
+    }, null);
 
     if (e.button === 0) { // Left click
-        if (clickX >= startX && clickX < startX + gridWidth) {
-          const lane = Math.floor((clickX - startX) / laneWidth);
-          const newId = nextNoteIdRef.current++;
-          setNotes(prev => {
-            const filtered = prev.filter(n => !(Math.abs(n.time - snappedTime) < 0.001 && n.lane === lane));
-            const sortedNotes = [...filtered].sort((a, b) => a.time - b.time);
-            const parentIndex = sortedNotes.findIndex(n => n.time > snappedTime) - 1;
-            const parentId = parentIndex >= 0 ? sortedNotes[parentIndex].id : (sortedNotes.length > 0 ? sortedNotes[sortedNotes.length - 1].id : null);
-            
-            return [...filtered, { id: newId, time: snappedTime, lane, type: selectedNoteType, width: noteWidth, parentId }];
-          });
-        }
+      if (e.ctrlKey && clickedNote) {
+        setDraggingNoteId(clickedNote.id);
+        return;
+      }
+
+      if (clickX >= startX && clickX < startX + gridWidth) {
+        const lane = Math.floor((clickX - startX) / laneWidth);
+        const newId = nextNoteIdRef.current++;
+        setNotes(prev => {
+          const filtered = prev.filter(n => !(Math.abs(n.time - snappedTime) < 0.001 && n.lane === lane));
+          const sortedNotes = [...filtered].sort((a, b) => a.time - b.time);
+          const parentIndex = sortedNotes.findIndex(n => n.time > snappedTime) - 1;
+          const autoParentId = parentIndex >= 0 ? sortedNotes[parentIndex].id : (sortedNotes.length > 0 ? sortedNotes[sortedNotes.length - 1].id : null);
+          const parentId = currentParentNote?.id ?? autoParentId;
+          
+          return [...filtered, { id: newId, time: snappedTime, lane, type: selectedNoteType, width: noteWidth, parentId }];
+        });
+      }
     } else if (e.button === 1) { // Middle click
       if (e.ctrlKey) {
         if (clickedNote) {
@@ -518,22 +1105,17 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
 
-    if (draggingNoteId) {
-      const { width, height } = canvas;
-      const lanes = 8;
-      const laneWidth = Math.min(60, width / (lanes + 2));
-      const gridWidth = lanes * laneWidth;
-      const startX = (width - gridWidth) / 2;
+    const { width, height } = canvas;
+    const lanes = 8;
+    const laneWidth = Math.min(60, width / (lanes + 2));
+    const gridWidth = lanes * laneWidth;
+    const startX = (width - gridWidth) / 2;
+    const hitLineY = height - 150;
+    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+    const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
 
-      let lane = Math.floor((clickX - startX) / laneWidth);
-      lane = Math.max(0, Math.min(lanes - 1, lane));
-      
-      const pixelsPerBeat = 150;
-      const hitLineY = height - 150;
-      
-      const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
-      const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
-      
+    if (draggingNoteId) {
+      const lane = Math.floor((clickX - startX) / laneWidth);
       const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
       
       const snap = gridZoom;
@@ -550,6 +1132,24 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       ));
     } else if (selectionBox) {
       setSelectionBox(prev => prev ? { ...prev, endX: clickX, endY: clickY } : null);
+    } else if (e.ctrlKey || isCtrlHeld) {
+      setHoverPreview(null);
+    } else if (clickX >= startX && clickX < startX + gridWidth) {
+      let lane = Math.floor((clickX - startX) / laneWidth);
+      lane = Math.max(0, Math.min(lanes - 1, lane));
+
+      const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
+      const snappedBeat = Math.round(clickBeat * gridZoom) / gridZoom;
+
+      if (snappedBeat < 0) {
+        setHoverPreview(null);
+        return;
+      }
+
+      const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
+      setHoverPreview({ lane, time: snappedTime });
+    } else {
+      setHoverPreview(null);
     }
   };
 
@@ -562,7 +1162,6 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         const laneWidth = Math.min(60, width / (lanes + 2));
         const gridWidth = lanes * laneWidth;
         const startX = (width - gridWidth) / 2;
-        const pixelsPerBeat = 150;
         const hitLineY = height - 150;
         const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
         const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
@@ -587,6 +1186,11 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
     setSelectionBox(null);
   };
 
+  const handleCanvasMouseLeave = () => {
+    setHoverPreview(null);
+    handleCanvasMouseUp();
+  };
+
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
   };
@@ -598,35 +1202,27 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       togglePlay();
     }
     
-    const pixelsPerBeat = 150;
-    const getActiveBpm = (time: number, changes: {time: number, bpm: number, timeSignature: string}[]) => {
-      const sortedChanges = [...changes].sort((a, b) => a.time - b.time);
-      let activeBpm = sortedChanges[0].bpm;
-      for (const change of sortedChanges) {
-        if (time >= change.time) {
-          activeBpm = change.bpm;
-        } else {
-          break;
-        }
-      }
-      return activeBpm;
-    };
-    const bpm = getActiveBpm(stateRef.current.currentTime, convertBpmChangesToTime(stateRef.current.bpmChanges));
-    const timeChange = (e.deltaY / pixelsPerBeat) * (60 / bpm);
+    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+    const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
+    const targetBeat = currentBeat + (e.deltaY / pixelsPerBeat);
     
-    let newTime = stateRef.current.currentTime + timeChange;
-    if (newTime < 0) newTime = 0;
-    if (audioRef.current && audioRef.current.duration && newTime > audioRef.current.duration) {
-      newTime = audioRef.current.duration;
+    // Snap to grid
+    const snappedBeat = Math.round(targetBeat * gridZoom) / gridZoom;
+    const newTime = getTimeAtBeat(snappedBeat, sortedChanges);
+    
+    let clampedTime = Math.max(0, newTime);
+    if (audioRef.current && audioRef.current.duration && clampedTime > audioRef.current.duration) {
+      clampedTime = audioRef.current.duration;
     }
     
-    setCurrentTime(newTime);
-    stateRef.current.currentTime = newTime;
+    setCurrentTime(clampedTime);
+    stateRef.current.currentTime = clampedTime;
     if (audioRef.current) {
-      audioRef.current.currentTime = newTime;
+      const offsetInSeconds = parseFloat(offset.toString()) / 1000;
+      audioRef.current.currentTime = Math.max(0, clampedTime - offsetInSeconds);
     }
     if (timeDisplayRef.current) {
-      timeDisplayRef.current.textContent = formatTime(newTime, convertBpmChangesToTime(stateRef.current.bpmChanges));
+      timeDisplayRef.current.textContent = formatTime(clampedTime, sortedChanges);
     }
     if (progressBarRef.current && !isDraggingProgress.current) {
       progressBarRef.current.value = newTime.toString();
@@ -635,40 +1231,12 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
 
   const saveLevel = async () => {
     if (!projectData) return;
-    const bpm = projectData.bpm || 120;
-    let content = `#OFFSET=${offset};\n`;
-    content += `#BEAT=1;\n`;
-    content += `#BPM_NUMBER=1;\n`;
-    content += `#BPM [0]=${bpm};\n`;
-    content += `#BPMS[0]=0;\n`;
-    content += `#SCN=1;\n`;
-    content += `#SC [0]=1;\n`;
-    content += `#SCI[0]=0;\n`;
-    
-    const sortedChanges = convertBpmChangesToTime(bpmChanges);
-    
-    notes.forEach(note => {
-      const totalBeats = getBeatAtTime(note.time, sortedChanges);
-      
-      let currentMeasureBeat = 0;
-      let measureCount = 0;
-      let currentBeatsPerMeasure = 4;
-      
-      while (measureCount < 10000) {
-        const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, sortedChanges);
-        const activeChange = getActiveChange(timeAtMeasure + 0.001, sortedChanges);
-        currentBeatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
-        
-        if (totalBeats < currentMeasureBeat + currentBeatsPerMeasure) {
-          break;
-        }
-        
-        currentMeasureBeat += currentBeatsPerMeasure;
-        measureCount++;
-      }
-      
-      const beatInMeasure = totalBeats - currentMeasureBeat;
-      content += `<${note.id}><${note.type}><${(measureCount + beatInMeasure / currentBeatsPerMeasure).toFixed(3)}><${note.lane}><${note.width}><1><${note.parentId || 0}>\n`;
+    const content = buildLevelText({
+      projectData,
+      notes,
+      bpmChanges,
+      speedChanges,
+      offset,
     });
     
     const fallbackDownload = (content: string) => {
@@ -703,6 +1271,17 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       fallbackDownload(content);
     }
   };
+
+  const currentParentId =
+    currentParentInput.trim() === '' ? null : parseInt(currentParentInput, 10);
+  const currentParentNote =
+    currentParentId === null || Number.isNaN(currentParentId)
+      ? null
+      : notes.find((note) => note.id === currentParentId) || null;
+  const selectedSingleNote =
+    selectedNoteIds.length === 1
+      ? notes.find((note) => note.id === selectedNoteIds[0]) || null
+      : null;
 
   return (
     <motion.div
@@ -780,8 +1359,17 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
         <div className="flex items-center gap-2 w-1/3 justify-end">
           {projectData && (
             <>
-              <div className="text-sm font-mono text-neutral-400 mr-2">
-                1/{gridZoom}
+              <div className="text-sm font-mono text-neutral-400 w-20 text-left">
+                Snap <span className="inline-block w-8 text-center">1/{gridZoom}</span>
+              </div>
+              <div className="text-sm font-mono text-neutral-400 w-24 text-left">
+                Zoom <span className="inline-block w-10 text-center">{pixelsPerBeat}px</span>
+              </div>
+              <div className="text-sm font-mono text-neutral-400 w-20 text-left">
+                FPS <span className="inline-block w-8 text-center">{fps}</span>
+              </div>
+              <div className="text-sm font-mono text-neutral-400 w-28 text-left">
+                Objects <span className="inline-block w-10 text-center">{renderedObjects}</span>
               </div>
               <div ref={timeDisplayRef} className="text-sm font-mono text-neutral-400 mr-4">
                 {formatTime(currentTime, convertBpmChangesToTime(bpmChanges))}
@@ -813,11 +1401,16 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
       </header>
 
       {/* Main Editor Area */}
-      <main className="flex-1 flex overflow-hidden">
+      <main className="flex-1 flex overflow-hidden min-h-0">
         {/* Left Sidebar - General Functions */}
-        <aside className="w-64 border-r border-neutral-800 bg-neutral-900/30 flex flex-col">
-          {activeLeftPanel === 'main' && (
-            <div className="p-4 flex flex-col gap-4 h-full">
+        <aside className={`${isLeftPanelCompact ? 'w-12' : 'w-64'} shrink-0 border-r border-neutral-800 bg-neutral-900/30 flex flex-col transition-all duration-300 overflow-hidden`}>
+          <div className="p-2 border-b border-neutral-800 flex justify-center">
+            <button onClick={() => setIsLeftPanelCompact(!isLeftPanelCompact)} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
+              {isLeftPanelCompact ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+            </button>
+          </div>
+          {!isLeftPanelCompact && activeLeftPanel === 'main' && (
+            <div className="p-4 flex flex-col gap-4 h-full overflow-y-auto min-h-0">
               <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">General Functions</div>
               <div className="flex flex-col gap-2 flex-1">
                 <button 
@@ -829,8 +1422,8 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
                 <button onClick={() => setActiveLeftPanel('bpmTiming')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
                   BPM / Timing
                 </button>
-                <button onClick={() => setActiveLeftPanel('curveNotes')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
-                  Curve Notes
+                <button onClick={() => setActiveLeftPanel('speedChanges')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
+                  Speed Changes
                 </button>
                 <button onClick={() => setActiveLeftPanel('curveSC')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
                   Curve SC
@@ -841,7 +1434,49 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
               </div>
               
               <div className="mt-auto pt-4 border-t border-neutral-800">
-                <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2">Selected Note</div>
+                <div className="mb-4">
+                  <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2">Current Parent</div>
+                  <input
+                    type="number"
+                    min="1"
+                    value={currentParentInput}
+                    placeholder="Auto"
+                    className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none"
+                    onChange={(e) => setCurrentParentInput(e.target.value)}
+                  />
+                  <div className="text-xs text-neutral-400 mt-2">
+                    {currentParentNote
+                      ? `ID ${currentParentNote.id} | Lane ${currentParentNote.lane + 1} | Type ${NOTE_TYPES[currentParentNote.type]?.name || currentParentNote.type}`
+                      : currentParentInput.trim() === ''
+                        ? 'Auto-select previous note when placing.'
+                        : 'No note exists with that ID.'}
+                  </div>
+                  <div className="flex gap-2 mt-2">
+                    <button
+                      onClick={() => setCurrentParentInput('')}
+                      className="flex-1 px-2 py-1.5 text-xs text-neutral-300 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+                    >
+                      Auto
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (selectedSingleNote) {
+                          setCurrentParentInput(selectedSingleNote.id.toString());
+                        }
+                      }}
+                      disabled={!selectedSingleNote}
+                      className="flex-1 px-2 py-1.5 text-xs text-neutral-300 bg-neutral-800 hover:bg-neutral-700 disabled:bg-neutral-900 disabled:text-neutral-600 rounded transition-colors"
+                    >
+                      Use Selected
+                    </button>
+                  </div>
+                  <div className="text-xs text-neutral-500 mt-2">
+                    Current ID: {Math.max(nextNoteIdRef.current - 1, 0)}
+                  </div>
+                </div>
+
+                <div className="pt-4 border-t border-neutral-800">
+                  <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2">Selected Note</div>
                 <div className="flex items-center gap-3">
                   <div className="w-8 h-8 rounded shadow-sm border border-neutral-700 flex items-center justify-center" style={{ backgroundColor: NOTE_TYPES[selectedNoteType]?.color || '#3b82f6' }}>
                   </div>
@@ -852,12 +1487,13 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
                 </div>
                 <div className="text-xs text-neutral-500 mt-2">Press A/D to switch type</div>
                 <div className="text-xs text-neutral-500 mt-1">Press Q/E to change width</div>
+                </div>
               </div>
             </div>
           )}
 
           {activeLeftPanel === 'editInfo' && (
-            <div className="p-4 flex flex-col h-full overflow-hidden">
+            <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
                   <ArrowLeft className="w-4 h-4" />
@@ -911,17 +1547,24 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
           )}
 
           {activeLeftPanel === 'bpmTiming' && (
-            <div className="p-4 flex flex-col h-full">
+            <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
                   <ArrowLeft className="w-4 h-4" />
                 </button>
                 <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">BPM / Timing</div>
               </div>
-              <div className="flex flex-col gap-4 overflow-y-auto flex-1 pr-1 pb-4">
+              <div className="flex flex-col gap-4 overflow-y-auto flex-1 pr-1 pb-4 min-h-0">
                 <div>
                   <label className="block text-xs text-neutral-400 mb-1">Offset (ms)</label>
-                  <input type="number" value={offset} className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => setOffset(parseFloat(e.target.value) || 0)} />
+                  <input type="number" value={offset} className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => {
+                    const val = e.target.value;
+                    if (val === '-' || val === "") setOffset(val);
+                    else {
+                      const num = parseFloat(val);
+                      setOffset(isNaN(num) ? 0 : num);
+                    }
+                  }} />
                 </div>
                 <div>
                   <label className="block text-xs text-neutral-400 mb-1">BPM Changes</label>
@@ -995,14 +1638,82 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
             </div>
           )}
 
-          {['curveNotes', 'curveSC', 'history'].includes(activeLeftPanel) && (
+          {activeLeftPanel === 'speedChanges' && (
+            <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
+              <div className="flex items-center gap-2 mb-4 shrink-0">
+                <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
+                  <ArrowLeft className="w-4 h-4" />
+                </button>
+                <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Speed Changes</div>
+              </div>
+              <div className="flex flex-col gap-4 overflow-y-auto flex-1 pr-1 pb-4 min-h-0">
+                <table className="w-full text-sm text-neutral-300">
+                  <thead>
+                    <tr className="text-left text-neutral-500">
+                      <th className="pb-2">Meas</th>
+                      <th className="pb-2">Beat</th>
+                      <th className="pb-2">Speed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {speedChanges.map((change, index) => (
+                      <tr key={index}>
+                        <td className="py-1"><input type="number" value={change.measure} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
+                          const newChanges = [...speedChanges];
+                          newChanges[index].measure = parseInt(e.target.value) || 0;
+                          setSpeedChanges(newChanges);
+                        }} /></td>
+                        <td className="py-1"><input type="number" value={change.beat} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
+                          const newChanges = [...speedChanges];
+                          newChanges[index].beat = parseInt(e.target.value) || 0;
+                          setSpeedChanges(newChanges);
+                        }} /></td>
+                        <td className="py-1"><input type="number" step="0.1" value={change.speedChange} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
+                          const newChanges = [...speedChanges];
+                          const val = parseFloat(e.target.value);
+                          newChanges[index].speedChange = isNaN(val) ? 1 : val;
+                          setSpeedChanges(newChanges);
+                        }} /></td>
+                        <td className="py-1">
+                          {index > 0 && (
+                            <button onClick={() => {
+                              const newChanges = speedChanges.filter((_, i) => i !== index);
+                              setSpeedChanges(newChanges);
+                            }} className="text-red-400 hover:text-red-300">
+                              <X className="w-4 h-4" />
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <button onClick={() => {
+                  const totalBeats = getBeatAtTime(currentTime, convertBpmChangesToTime(bpmChanges));
+                  const activeChange = getActiveChange(currentTime, convertBpmChangesToTime(bpmChanges));
+                  const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
+                  
+                  const measure = Math.floor(totalBeats / beatsPerMeasure);
+                  const beat = Math.floor(totalBeats % beatsPerMeasure);
+
+                  setSpeedChanges([...speedChanges, {
+                    measure: measure,
+                    beat: beat,
+                    speedChange: 1
+                  }]);
+                }} className="w-full p-2 bg-neutral-800 hover:bg-neutral-700 text-white rounded text-sm mt-2 transition-colors">Add Speed Change</button>
+              </div>
+            </div>
+          )}
+
+          {['curveSC', 'history'].includes(activeLeftPanel) && (
             <div className="p-4 flex flex-col h-full">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
                   <ArrowLeft className="w-4 h-4" />
                 </button>
                 <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
-                  {activeLeftPanel === 'curveNotes' ? 'Curve Notes' : activeLeftPanel === 'curveSC' ? 'Curve SC' : 'History'}
+                  {activeLeftPanel === 'curveSC' ? 'Curve SC' : 'History'}
                 </div>
               </div>
               <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
@@ -1031,6 +1742,7 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
               containerRef={containerRef}
               projectData={projectData}
               gridZoom={gridZoom}
+              pixelsPerBeat={pixelsPerBeat}
               stateRef={stateRef}
               selectedNoteIds={selectedNoteIds}
               selectionBox={selectionBox}
@@ -1041,18 +1753,27 @@ export default function Editor({ onBack, mode }: { onBack: () => void, mode?: 'n
               onMouseDown={handleCanvasMouseDown}
               onMouseMove={handleCanvasMouseMove}
               onMouseUp={handleCanvasMouseUp}
-              onMouseLeave={handleCanvasMouseUp}
+              onMouseLeave={handleCanvasMouseLeave}
               onContextMenu={handleContextMenu}
             />
           )}
         </section>
 
         {/* Right Sidebar - Properties */}
-        <aside className="w-64 border-l border-neutral-800 bg-neutral-900/30 p-4 flex flex-col gap-4">
-          <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Properties</div>
-          <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
-            Select a note to edit its properties
+        <aside className={`${isRightPanelCompact ? 'w-12' : 'w-64'} shrink-0 border-l border-neutral-800 bg-neutral-900/30 flex flex-col transition-all duration-300 overflow-hidden`}>
+          <div className="p-2 border-b border-neutral-800 flex justify-center">
+            <button onClick={() => setIsRightPanelCompact(!isRightPanelCompact)} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
+              {isRightPanelCompact ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+            </button>
           </div>
+          {!isRightPanelCompact && (
+            <div className="p-4 flex flex-col gap-4">
+              <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Properties</div>
+              <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
+                Select a note to edit its properties
+              </div>
+            </div>
+          )}
         </aside>
       </main>
     </motion.div>
