@@ -16,6 +16,10 @@ const SOUND_URLS: Record<string, string> = {
 };
 const HIT_SOUND_LOOKAHEAD_SECONDS = 0.12;
 const HIT_SOUND_JUMP_TOLERANCE_SECONDS = 0.25;
+const HOVER_PREVIEW_FRAME_INTERVAL_MS = 1000 / 30;
+const AUDIO_CLOCK_HANDOFF_DELAY_MS = 200;
+const AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS = 0.05;
+const AUDIO_SEEK_TIMEOUT_MS = 10000;
 
 interface EditorProps {
   onBack: () => void;
@@ -33,6 +37,9 @@ interface EditorProps {
 interface EditorRuntimeState {
   isPlaying: boolean;
   currentTime: number;
+  playbackStartTime: number;
+  playbackStartPerformanceTime: number;
+  playbackAudioClockReadyTime: number;
   bpm: number;
   bpmChanges: BpmChange[];
   speedChanges: SpeedChange[];
@@ -64,6 +71,11 @@ const getPreviousHoldConnectorId = (notes: Note[], time: number) => {
     .at(-1);
 
   return previousHoldConnector?.id ?? null;
+};
+
+const getNoteIdGroupKey = (note: Note, noteBeat: number) => {
+  const centerPosition = note.lane + note.width / 4;
+  return `${noteBeat.toFixed(6)}:${centerPosition.toFixed(6)}`;
 };
 
 const formatGroupedIds = (ids: number[]) => {
@@ -125,6 +137,7 @@ export default function Editor({
   const [currentParentInput, setCurrentParentInput] = useState('');
   const [hoverPreview, setHoverPreview] = useState<HoverPreview | null>(null);
   const [isCtrlHeld, setIsCtrlHeld] = useState(false);
+  const [isShiftHeld, setIsShiftHeld] = useState(false);
   const [selectedNoteIds, setSelectedNoteIds] = useState<number[]>([]);
   const [draggingNoteId, setDraggingNoteId] = useState<number | null>(null);
   const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
@@ -140,7 +153,8 @@ export default function Editor({
     songIllustration: null as File | null,
   });
   const [illustrationPreview, setIllustrationPreview] = useState<string | null>(null);
-  const shouldOmitParentForType = (type: number) => HOLD_START_TYPES.includes(type);
+  const canTypeHaveParent = (type: number) => HOLD_CENTER_TYPES.includes(type) || HOLD_END_TYPES.includes(type);
+  const shouldOmitParentForType = (type: number) => !canTypeHaveParent(type);
 
   useEffect(() => {
     if (formData.songIllustration) {
@@ -173,6 +187,7 @@ export default function Editor({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const requestRef = useRef<number>();
+  const hoverPreviewTimeoutRef = useRef<number>();
   const fpsFrameCountRef = useRef(0);
   const fpsWindowStartRef = useRef(performance.now());
   const renderedObjectsRef = useRef(0);
@@ -182,6 +197,7 @@ export default function Editor({
   const pendingDragUpdateRef = useRef<PendingDragUpdate | null>(null);
   const dragUpdateFrameRef = useRef<number>();
   const hoverPreviewRef = useRef<HoverPreview | null>(null);
+  const playRequestIdRef = useRef(0);
 
   const openSettings = () => {
     setIsSettingsOpen(true);
@@ -229,6 +245,9 @@ export default function Editor({
   const stateRef = useRef<EditorRuntimeState>({
     isPlaying: false,
     currentTime: 0,
+    playbackStartTime: 0,
+    playbackStartPerformanceTime: 0,
+    playbackAudioClockReadyTime: 0,
     bpm: 120,
     bpmChanges: [{ measure: 0, beat: 0, bpm: 120, timeSignature: '4/4' }],
     speedChanges: [{ measure: 0, beat: 0, speedChange: 1 }],
@@ -245,7 +264,9 @@ export default function Editor({
 
   useEffect(() => {
     stateRef.current.isPlaying = isPlaying;
-    stateRef.current.currentTime = currentTime;
+    if (!isPlaying) {
+      stateRef.current.currentTime = currentTime;
+    }
     stateRef.current.bpm = projectData?.bpm || 120;
     stateRef.current.bpmChanges = bpmChanges;
     stateRef.current.offset = offset;
@@ -264,10 +285,10 @@ export default function Editor({
   }, [hoverPreview]);
 
   useEffect(() => {
-    if (isCtrlHeld) {
+    if (isCtrlHeld || isShiftHeld) {
       setHoverPreview(null);
     }
-  }, [isCtrlHeld]);
+  }, [isCtrlHeld, isShiftHeld]);
 
   useEffect(() => {
     if (mode === 'new') {
@@ -286,12 +307,15 @@ export default function Editor({
     const notesById = new Map<number, Note>();
     const noteBeats = new Map<number, number>();
     const groupedNoteIds = new Map<string, number[]>();
+    const groupedIdLabelsByNoteId = new Map<number, string>();
 
     notes.forEach((note) => {
-      notesById.set(note.id, note);
-      noteBeats.set(note.id, getBeatAtTime(note.time, timedBpmChanges));
+      const noteBeat = getBeatAtTime(note.time, timedBpmChanges);
 
-      const key = `${note.time.toFixed(6)}:${note.lane}`;
+      notesById.set(note.id, note);
+      noteBeats.set(note.id, noteBeat);
+
+      const key = getNoteIdGroupKey(note, noteBeat);
       const groupedIds = groupedNoteIds.get(key);
       if (groupedIds) {
         groupedIds.push(note.id);
@@ -300,14 +324,16 @@ export default function Editor({
       }
     });
 
-    const groupedIdLabels = new Map<string, string>();
-    groupedNoteIds.forEach((groupedIds, key) => {
-      groupedIdLabels.set(key, formatGroupedIds(groupedIds));
+    groupedNoteIds.forEach((groupedIds) => {
+      const label = formatGroupedIds(groupedIds);
+      groupedIds.forEach((noteId) => {
+        groupedIdLabelsByNoteId.set(noteId, label);
+      });
     });
 
     const selectedParentNoteIds = new Set<number>();
     notes.forEach((note) => {
-      if (selectedNoteIdSet.has(note.id) && note.parentId !== null) {
+      if (selectedNoteIdSet.has(note.id) && canTypeHaveParent(note.type) && note.parentId !== null) {
         selectedParentNoteIds.add(note.parentId);
       }
     });
@@ -315,7 +341,7 @@ export default function Editor({
     return {
       notesById,
       noteBeats,
-      groupedIdLabels,
+      groupedIdLabelsByNoteId,
       selectedParentNoteIds,
     };
   }, [notes, timedBpmChanges, selectedNoteIdSet]);
@@ -373,8 +399,8 @@ export default function Editor({
       audioUrl
     });
 
-    // Only initialize timing data when creating a fresh project.
-    if (!projectData) {
+    // Imported charts can exist before project metadata is set, so only seed BPMs for actual new projects.
+    if (!projectData && mode === 'new') {
       setBpmChanges([{ measure: 0, beat: 0, bpm: nextBpm, timeSignature: '4/4' }]);
     }
 
@@ -506,6 +532,8 @@ export default function Editor({
     
     setCurrentTime(newTime);
     stateRef.current.currentTime = newTime;
+    stateRef.current.playbackStartTime = newTime;
+    stateRef.current.playbackStartPerformanceTime = performance.now();
     lastPlayedTimeRef.current = newTime;
     hitSoundCursorRef.current = findHitSoundCursor(newTime);
     scheduledHitSoundKeysRef.current.clear();
@@ -548,57 +576,134 @@ export default function Editor({
     return low;
   };
 
-  const togglePlay = useCallback(() => {
+  const getPlaybackTimeFromClock = (audio: HTMLAudioElement | null, offsetInSeconds: number) => {
+    const now = performance.now();
+    const projectedTime = Math.max(
+      0,
+      stateRef.current.playbackStartTime
+        + (now - stateRef.current.playbackStartPerformanceTime) / 1000,
+    );
+
+    if (audio && !audio.paused && !audio.seeking && now >= stateRef.current.playbackAudioClockReadyTime) {
+      const audioTime = Math.max(0, audio.currentTime + offsetInSeconds);
+      if (Math.abs(audioTime - projectedTime) <= AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS) {
+        return audioTime;
+      }
+    }
+
+    return projectedTime;
+  };
+
+  const seekAudioToTime = (audio: HTMLAudioElement, time: number) => new Promise<void>((resolve) => {
+    const targetTime = Math.max(0, time);
+    let settled = false;
+    let timeoutId: number | undefined;
+
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+      audio.removeEventListener('seeked', finish);
+      resolve();
+    };
+
+    audio.addEventListener('seeked', finish);
+    timeoutId = window.setTimeout(finish, AUDIO_SEEK_TIMEOUT_MS);
+    audio.currentTime = targetTime;
+
+    if (!audio.seeking && Math.abs(audio.currentTime - targetTime) <= AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS) {
+      finish();
+    }
+  });
+
+  const togglePlay = useCallback(async () => {
     if (!audioRef.current || !projectData) return;
     const offsetInSeconds = parseFloat(offset.toString()) / 1000;
     
     if (stateRef.current.isPlaying) {
+      playRequestIdRef.current += 1;
+      const playbackTime = Math.max(0, stateRef.current.currentTime);
       stopHitsounds();
       audioRef.current.pause();
       // Clear any pending timeout if they were about to play
       if (window.hasOwnProperty('playTimeout')) {
         clearTimeout((window as any).playTimeout);
       }
+      if (requestRef.current) {
+        cancelAnimationFrame(requestRef.current);
+        requestRef.current = undefined;
+      }
+      if (hoverPreviewTimeoutRef.current) {
+        window.clearTimeout(hoverPreviewTimeoutRef.current);
+        hoverPreviewTimeoutRef.current = undefined;
+      }
+      stateRef.current.isPlaying = false;
       setIsPlaying(false);
-      
-      console.log('Paused, audioTime:', audioRef.current.currentTime);
-      
-      // Snap to nearest beat
+
+      // Snap back to the last whole beat the playhead passed.
       const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
-      const activeChange = getActiveChange(audioRef.current.currentTime + offsetInSeconds, sortedChanges);
-      const bpm = activeChange.bpm;
-      
-      const currentBeat = (audioRef.current.currentTime + Math.max(0, offsetInSeconds)) * (bpm / 60);
-      const snappedBeat = Math.round(currentBeat);
+      const currentBeat = getBeatAtTime(playbackTime, sortedChanges);
+      const snappedBeat = Math.floor(currentBeat);
       const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
       
       setCurrentTime(snappedTime);
       stateRef.current.currentTime = snappedTime;
+      stateRef.current.playbackStartTime = snappedTime;
+      stateRef.current.playbackStartPerformanceTime = performance.now();
+      stateRef.current.playbackAudioClockReadyTime = 0;
       lastPlayedTimeRef.current = snappedTime;
       hitSoundCursorRef.current = findHitSoundCursor(snappedTime);
       audioRef.current.currentTime = Math.max(0, snappedTime - offsetInSeconds);
+      if (timeDisplayRef.current) {
+        timeDisplayRef.current.textContent = formatTime(snappedTime, sortedChanges);
+      }
+      if (progressBarRef.current && !isDraggingProgress.current) {
+        progressBarRef.current.value = snappedTime.toString();
+      }
     } else {
+      const playRequestId = playRequestIdRef.current + 1;
+      playRequestIdRef.current = playRequestId;
+      const playbackStartTime = Math.max(0, stateRef.current.currentTime);
       const musicContext = setupMusicGain();
       if (musicContext?.state === 'suspended') {
         musicContext.resume().catch(() => {});
       }
       void prepareHitSounds();
-      hitSoundCursorRef.current = findHitSoundCursor(stateRef.current.currentTime);
+      hitSoundCursorRef.current = findHitSoundCursor(playbackStartTime);
       scheduledHitSoundKeysRef.current.clear();
-      lastPlayedTimeRef.current = stateRef.current.currentTime;
-
+      lastPlayedTimeRef.current = playbackStartTime;
       // Apply offset here. If delay (offset > 0), wait. If advance (offset < 0), seek.
       if (offsetInSeconds > 0) {
         // Delay music: Editor starts at current time, Music starts playing after offsetInSeconds past audio seek point
-        audioRef.current.currentTime = Math.max(0, stateRef.current.currentTime - offsetInSeconds);
+        const audioStartTime = playbackStartTime - offsetInSeconds;
+        audioRef.current.currentTime = Math.max(0, audioStartTime);
+        const audioDelaySeconds = Math.max(0, -audioStartTime);
         (window as any).playTimeout = setTimeout(() => {
-            if (audioRef.current) audioRef.current.play();
-        }, offsetInSeconds * 1000);
+          if (playRequestIdRef.current === playRequestId && audioRef.current) {
+            audioRef.current.play();
+          }
+        }, audioDelaySeconds * 1000);
       } else {
         // Advance music: Start music early
-        audioRef.current.currentTime = Math.max(0, stateRef.current.currentTime - offsetInSeconds);
-        audioRef.current.play();
+        await seekAudioToTime(audioRef.current, playbackStartTime - offsetInSeconds);
+        if (playRequestIdRef.current !== playRequestId) {
+          return;
+        }
+        await audioRef.current.play().catch(() => {});
       }
+      if (playRequestIdRef.current !== playRequestId) {
+        return;
+      }
+      stateRef.current.playbackStartTime = playbackStartTime;
+      stateRef.current.playbackStartPerformanceTime = performance.now();
+      stateRef.current.playbackAudioClockReadyTime = stateRef.current.playbackStartPerformanceTime + AUDIO_CLOCK_HANDOFF_DELAY_MS;
+      stateRef.current.currentTime = playbackStartTime;
+      stateRef.current.isPlaying = true;
       
       setIsPlaying(true);
     }
@@ -614,6 +719,20 @@ export default function Editor({
 
       if (e.key === 'Control') {
         setIsCtrlHeld(true);
+      }
+
+      if (e.key === 'Shift') {
+        setIsShiftHeld(true);
+      }
+
+      if (e.key === 'Delete') {
+        setNotes(prev => prev.filter(n => !selectedNoteIds.includes(n.id)));
+        setSelectedNoteIds([]);
+        setDraggingNoteId(null);
+        setSelectionBox(null);
+        setHoverPreview(null);
+        pendingDragUpdateRef.current = null;
+        return;
       }
 
       if (!isOnlyKeyPressed(e)) return;
@@ -667,20 +786,21 @@ export default function Editor({
         setNoteWidth(prev => Math.min(16, prev + 1));
       }
 
-      if (e.key === 'Delete') {
-        setNotes(prev => prev.filter(n => !selectedNoteIds.includes(n.id)));
-        setSelectedNoteIds([]);
-      }
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.key === 'Control') {
         setIsCtrlHeld(false);
       }
+
+      if (e.key === 'Shift') {
+        setIsShiftHeld(false);
+      }
     };
 
     const handleWindowBlur = () => {
       setIsCtrlHeld(false);
+      setIsShiftHeld(false);
       setHoverPreview(null);
     };
 
@@ -823,7 +943,7 @@ export default function Editor({
     let time = stateRef.current.currentTime;
     
     if (stateRef.current.isPlaying && audioRef.current) {
-      time = audioRef.current.currentTime + offsetInSeconds;
+      time = getPlaybackTimeFromClock(audioRef.current, offsetInSeconds);
       stateRef.current.currentTime = time;
     }
 
@@ -1088,13 +1208,13 @@ export default function Editor({
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        const groupedIdsLabel = noteRenderIndex.groupedIdLabels.get(`${note.time.toFixed(6)}:${note.lane}`) ?? `${note.id}`;
-        ctx.fillText(groupedIdsLabel, x + notePixelWidth / 2, y + 12);
+        const groupedIdsLabel = noteRenderIndex.groupedIdLabelsByNoteId.get(note.id) ?? `${note.id}`;
+        ctx.fillText(groupedIdsLabel, noteCenterX, y + 12);
         objectCount += 1;
       }
     });
 
-    if (hoverPreview && !isCtrlHeld) {
+    if (hoverPreview && !isCtrlHeld && !isShiftHeld) {
       const previewBeat = getBeatAtTime(hoverPreview.time, sortedChanges);
       const previewY = hitLineY - (previewBeat - currentBeat) * pixelsPerBeat;
 
@@ -1202,14 +1322,14 @@ export default function Editor({
     objectCount += 1;
     renderedObjectsRef.current = objectCount;
 
-  }, [pixelsPerBeat, projectData, gridZoom, hoverPreview, isCtrlHeld, noteWidth, selectedNoteIdSet, selectedNoteType, selectionBox, timedBpmChanges, noteRenderIndex, offset]);
+  }, [pixelsPerBeat, projectData, gridZoom, hoverPreview, isCtrlHeld, isShiftHeld, noteWidth, selectedNoteIdSet, selectedNoteType, selectionBox, timedBpmChanges, noteRenderIndex, offset]);
 
-  const shouldAnimateCanvas = isPlaying || (!!hoverPreview && !isCtrlHeld);
+  const shouldAnimateCanvas = isPlaying || (!!hoverPreview && !isCtrlHeld && !isShiftHeld);
 
   const update = useCallback(() => {
     if (stateRef.current.isPlaying && audioRef.current) {
       const offsetInSeconds = parseFloat(offset.toString()) / 1000;
-      const currentTime = audioRef.current.currentTime + offsetInSeconds;
+      const currentTime = getPlaybackTimeFromClock(audioRef.current, offsetInSeconds);
       const scheduleUntil = currentTime + HIT_SOUND_LOOKAHEAD_SECONDS;
       const lastTime = lastPlayedTimeRef.current;
 
@@ -1248,12 +1368,17 @@ export default function Editor({
 
     drawGrid();
     setRenderedObjects(renderedObjectsRef.current);
-    if (stateRef.current.isPlaying || (hoverPreview && !isCtrlHeld)) {
+    if (stateRef.current.isPlaying) {
       requestRef.current = requestAnimationFrame(update);
+    } else if (hoverPreview && !isCtrlHeld && !isShiftHeld) {
+      hoverPreviewTimeoutRef.current = window.setTimeout(() => {
+        hoverPreviewTimeoutRef.current = undefined;
+        requestRef.current = requestAnimationFrame(update);
+      }, HOVER_PREVIEW_FRAME_INTERVAL_MS);
     } else {
       requestRef.current = undefined;
     }
-  }, [drawGrid, offset, playHitSound, hoverPreview, isCtrlHeld]);
+  }, [drawGrid, offset, playHitSound, hoverPreview, isCtrlHeld, isShiftHeld]);
 
   useEffect(() => {
     if (!shouldAnimateCanvas) {
@@ -1265,6 +1390,10 @@ export default function Editor({
       if (requestRef.current) {
         cancelAnimationFrame(requestRef.current);
         requestRef.current = undefined;
+      }
+      if (hoverPreviewTimeoutRef.current) {
+        window.clearTimeout(hoverPreviewTimeoutRef.current);
+        hoverPreviewTimeoutRef.current = undefined;
       }
       return;
     }
@@ -1279,6 +1408,10 @@ export default function Editor({
       if (requestRef.current) {
         cancelAnimationFrame(requestRef.current);
         requestRef.current = undefined;
+      }
+      if (hoverPreviewTimeoutRef.current) {
+        window.clearTimeout(hoverPreviewTimeoutRef.current);
+        hoverPreviewTimeoutRef.current = undefined;
       }
     };
   }, [drawGrid, shouldAnimateCanvas, update]);
@@ -1312,26 +1445,35 @@ export default function Editor({
     
     const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
 
-    const clickedNote = stateRef.current.notes.reduce<Note | null>((highestNote, note) => {
+    const hitNotes = stateRef.current.notes.filter((note) => {
       const noteBeat = noteRenderIndex.noteBeats.get(note.id) ?? getBeatAtTime(note.time, sortedChanges);
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       const noteStartX = startX + note.lane * laneWidth;
       const noteEndX = noteStartX + (laneWidth / 2) * note.width;
-      const isHit = clickX >= noteStartX && clickX <= noteEndX && clickY >= noteY - 10 && clickY <= noteY + 10;
-
-      if (!isHit) {
-        return highestNote;
-      }
-
-      if (!highestNote || note.id > highestNote.id) {
-        return note;
-      }
-
-      return highestNote;
-    }, null);
+      return clickX >= noteStartX && clickX <= noteEndX && clickY >= noteY - 10 && clickY <= noteY + 10;
+    });
+    const clickedNote = hitNotes.reduce<Note | null>((highestNote, note) => (
+      !highestNote || note.id > highestNote.id ? note : highestNote
+    ), null);
+    const ctrlClickedNote = hitNotes.reduce<Note | null>((selectedNote, note) => (
+      selectedNoteIdSet.has(note.id) && (!selectedNote || note.id > selectedNote.id)
+        ? note
+        : selectedNote
+    ), null) ?? clickedNote;
 
     if (e.button === 0) { // Left click
-      if (e.ctrlKey && clickedNote) {
+      if (e.ctrlKey) {
+        if (ctrlClickedNote) {
+          setSelectedNoteIds(prev => (
+            prev.includes(ctrlClickedNote.id)
+              ? prev.filter(id => id !== ctrlClickedNote.id)
+              : [...prev, ctrlClickedNote.id]
+          ));
+        }
+        return;
+      }
+
+      if (e.shiftKey && clickedNote) {
         setSelectedNoteIds([clickedNote.id]);
         setDraggingNoteId(clickedNote.id);
         return;
@@ -1343,19 +1485,18 @@ export default function Editor({
         const isHoldConnector = HOLD_CONNECTOR_TYPES.includes(selectedNoteType);
         const isHoldStart = HOLD_START_TYPES.includes(selectedNoteType);
         setNotes(prev => {
-          const filtered = prev.filter(n => !(Math.abs(n.time - snappedTime) < 0.001 && n.lane === lane));
           const manualParentId =
-            currentParentNote && filtered.some(note => note.id === currentParentNote.id)
+            currentParentNote && prev.some(note => note.id === currentParentNote.id)
               ? currentParentNote.id
               : null;
           const autoParentId = isHoldConnector && !isHoldStart
-            ? getPreviousHoldConnectorId(filtered, snappedTime)
+            ? getPreviousHoldConnectorId(prev, snappedTime)
             : null;
           const parentId = isHoldConnector && !isHoldStart
             ? manualParentId ?? autoParentId
             : null;
           
-          return [...filtered, { id: newId, time: snappedTime, lane, type: selectedNoteType, width: noteWidth, parentId }];
+          return [...prev, { id: newId, time: snappedTime, lane, type: selectedNoteType, width: noteWidth, parentId }];
         });
 
         if (isHoldConnector && currentParentInput.trim() !== '') {
@@ -1363,7 +1504,7 @@ export default function Editor({
         }
       }
     } else if (e.button === 1) { // Middle click
-      if (e.ctrlKey) {
+      if (e.shiftKey) {
         if (clickedNote) {
           setDraggingNoteId(clickedNote.id);
         }
@@ -1433,7 +1574,7 @@ export default function Editor({
       }
     } else if (selectionBox) {
       setSelectionBox(prev => prev ? { ...prev, endX: clickX, endY: clickY } : null);
-    } else if (e.ctrlKey || isCtrlHeld) {
+    } else if (e.ctrlKey || e.shiftKey || isCtrlHeld || isShiftHeld) {
       if (hoverPreviewRef.current !== null) {
         setHoverPreview(null);
       }
@@ -1549,6 +1690,8 @@ export default function Editor({
     
     setCurrentTime(clampedTime);
     stateRef.current.currentTime = clampedTime;
+    stateRef.current.playbackStartTime = clampedTime;
+    stateRef.current.playbackStartPerformanceTime = performance.now();
     lastPlayedTimeRef.current = clampedTime;
     hitSoundCursorRef.current = findHitSoundCursor(clampedTime);
     scheduledHitSoundKeysRef.current.clear();
@@ -1621,6 +1764,7 @@ export default function Editor({
     selectedSingleNote?.parentId === null || selectedSingleNote?.parentId === undefined
       ? null
       : notes.find((note) => note.id === selectedSingleNote.parentId) || null;
+  const canEditSelectedNoteParent = selectedSingleNote ? canTypeHaveParent(selectedSingleNote.type) : false;
   const getTimeposFromTime = (time: number) => {
     const totalBeats = getBeatAtTime(time, timedBpmChanges);
     let currentMeasureBeat = 0;
@@ -1662,7 +1806,7 @@ export default function Editor({
     return getTimeAtBeat(currentMeasureBeat + measureDecimal * currentBeatsPerMeasure, timedBpmChanges);
   };
   const selectedNoteTimepos = selectedSingleNote ? getTimeposFromTime(selectedSingleNote.time) : 0;
-  const notePropertyInputClass = 'w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none';
+  const notePropertyInputClass = 'w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none disabled:cursor-not-allowed disabled:border-neutral-800 disabled:bg-neutral-900 disabled:text-neutral-600';
   const updateSelectedNote = (updates: Partial<Note>) => {
     if (!selectedSingleNote) return;
 
@@ -1687,6 +1831,8 @@ export default function Editor({
 
     setCurrentTime(clampedTime);
     stateRef.current.currentTime = clampedTime;
+    stateRef.current.playbackStartTime = clampedTime;
+    stateRef.current.playbackStartPerformanceTime = performance.now();
     lastPlayedTimeRef.current = clampedTime;
     hitSoundCursorRef.current = findHitSoundCursor(clampedTime);
     scheduledHitSoundKeysRef.current.clear();
@@ -2400,7 +2546,7 @@ export default function Editor({
               <div className="w-16 h-16 border-2 border-dashed border-neutral-700 rounded-full flex items-center justify-center">
                 <span className="text-2xl">🎵</span>
               </div>
-              <p>Fill in project details to start editing</p>
+              <p>Fill in project details in Chart Metadata to start editing.</p>
             </div>
           ) : (
             <EditorCanvas 
@@ -2528,6 +2674,7 @@ export default function Editor({
                         value={selectedSingleNote.parentId ?? ''}
                         placeholder="None"
                         className={notePropertyInputClass}
+                        disabled={!canEditSelectedNoteParent}
                         onChange={(e) => {
                           const value = e.target.value.trim();
                           updateSelectedNote({ parentId: value === '' ? null : Math.max(0, Number(value) || 0) });
@@ -2535,7 +2682,7 @@ export default function Editor({
                       />
                       <button
                         type="button"
-                        disabled={!selectedParentNote}
+                        disabled={!canEditSelectedNoteParent || !selectedParentNote}
                         onClick={() => {
                           if (selectedParentNote) {
                             jumpToNoteTime(selectedParentNote.time);
@@ -2566,7 +2713,7 @@ export default function Editor({
                 <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
                   {selectedNoteIds.length > 1
                     ? `${selectedNoteIds.length} notes selected`
-                    : 'Ctrl-click a note to edit its properties'}
+                    : 'Shift-click a note to edit its properties'}
                 </div>
               )}
             </div>

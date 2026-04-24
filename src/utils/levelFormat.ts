@@ -9,10 +9,46 @@ interface ParsedLevelData {
   offset: number;
 }
 
+const DEFAULT_BPM_CHANGE: BpmChange = {
+  measure: 0,
+  beat: 0,
+  bpm: 120,
+  timeSignature: '4/4',
+};
+
+const TIMEPOS_PRECISION = 1000;
+
+const parseIndexedNumericValue = (line: string, prefix: string) => {
+  const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = line.match(new RegExp(`^${escapedPrefix}\\[(\\d+)\\]=(\\d+\\.?\\d*);$`));
+  if (!match) {
+    return null;
+  }
+
+  return {
+    index: parseInt(match[1], 10),
+    value: parseFloat(match[2]),
+  };
+};
+
+const convertTimeposToBpmChange = (timepos: number, bpm: number): BpmChange => {
+  const roundedUnits = Math.round(timepos * TIMEPOS_PRECISION);
+  const measure = Math.floor(roundedUnits / TIMEPOS_PRECISION);
+  const beatUnits = roundedUnits % TIMEPOS_PRECISION;
+
+  return {
+    measure,
+    beat: (beatUnits / TIMEPOS_PRECISION) * 4,
+    bpm,
+    timeSignature: '4/4',
+  };
+};
+
 export function parseLevelText(text: string): ParsedLevelData {
   const lines = text.split('\n');
   const notes: Note[] = [];
-  const bpmChanges: BpmChange[] = [];
+  const bpmValues = new Map<number, number>();
+  const bpmPositions = new Map<number, number>();
   const speedChanges: SpeedChange[] = [];
   let offset = 0;
 
@@ -24,16 +60,15 @@ export function parseLevelText(text: string): ParsedLevelData {
       continue;
     }
 
-    if (normalizedLine.startsWith('#BPM [')) {
-      const match = normalizedLine.match(/#BPM \[(\d+)\]=(\d+\.?\d*);/);
-      if (match) {
-        bpmChanges.push({
-          measure: 0,
-          beat: 0,
-          bpm: parseFloat(match[2]),
-          timeSignature: '4/4',
-        });
-      }
+    const bpmValueEntry = parseIndexedNumericValue(normalizedLine, '#BPM ');
+    if (bpmValueEntry) {
+      bpmValues.set(bpmValueEntry.index, bpmValueEntry.value);
+      continue;
+    }
+
+    const bpmPositionEntry = parseIndexedNumericValue(normalizedLine, '#BPMS');
+    if (bpmPositionEntry) {
+      bpmPositions.set(bpmPositionEntry.index, bpmPositionEntry.value);
       continue;
     }
 
@@ -73,10 +108,22 @@ export function parseLevelText(text: string): ParsedLevelData {
       continue;
     }
 
+    const bpmChanges = Array.from(bpmValues.entries())
+      .map(([entryIndex, bpm]) => convertTimeposToBpmChange(bpmPositions.get(entryIndex) ?? 0, bpm))
+      .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat))
+      .filter((change, entryIndex, changes) => {
+        if (entryIndex === 0) {
+          return true;
+        }
+
+        const previous = changes[entryIndex - 1];
+        return previous.measure !== change.measure || previous.beat !== change.beat || previous.bpm !== change.bpm;
+      });
+
     const timedBpmChanges = convertBpmChangesToTime(
       bpmChanges.length > 0
         ? bpmChanges
-        : [{ measure: 0, beat: 0, bpm: 120, timeSignature: '4/4' }],
+        : [DEFAULT_BPM_CHANGE],
     );
 
     notes.push({
@@ -89,6 +136,18 @@ export function parseLevelText(text: string): ParsedLevelData {
       parentId: parsedParentId >= 0 ? parsedParentId : null,
     });
   }
+
+  const bpmChanges = Array.from(bpmValues.entries())
+    .map(([index, bpm]) => convertTimeposToBpmChange(bpmPositions.get(index) ?? 0, bpm))
+    .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat))
+    .filter((change, index, changes) => {
+      if (index === 0) {
+        return true;
+      }
+
+      const previous = changes[index - 1];
+      return previous.measure !== change.measure || previous.beat !== change.beat || previous.bpm !== change.bpm;
+    });
 
   return { notes, bpmChanges, speedChanges, offset };
 }
@@ -112,12 +171,17 @@ export function buildLevelText(params: {
     const numericSpeed = Number(normalizedSpeed);
     return Number.isFinite(numericSpeed) ? formatNoteValue(numericSpeed) : normalizedSpeed;
   };
+  const normalizedBpmChanges = [...(bpmChanges.length > 0 ? bpmChanges : [DEFAULT_BPM_CHANGE])]
+    .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
+  const formatTimepos = (change: BpmChange) => (change.measure + change.beat / 4).toFixed(3);
 
   let content = `#OFFSET=${parseFloat(offset.toString()) / -1000};\n`;
   content += '#BEAT=1;\n';
-  content += '#BPM_NUMBER=1;\n';
-  content += `#BPM [0]=${projectData.bpm || 120};\n`;
-  content += '#BPMS[0]=0;\n';
+  content += `#BPM_NUMBER=${normalizedBpmChanges.length};\n`;
+  normalizedBpmChanges.forEach((change, index) => {
+    content += `#BPM [${index}]=${change.bpm};\n`;
+    content += `#BPMS[${index}]=${formatTimepos(change)};\n`;
+  });
   content += `#SCN=${speedChanges.length};\n`;
 
   speedChanges.forEach((change, index) => {
