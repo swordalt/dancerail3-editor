@@ -260,7 +260,7 @@ export default function EditorCanvas({
 
     // Draw hold connections
     stateRef.current.notes.forEach((note) => {
-      if (HOLD_CONNECTOR_TYPES.includes(note.type) && note.parentId !== null) {
+      if (HOLD_CONNECTOR_TYPES.includes(note.type) && !HOLD_START_TYPES.includes(note.type) && note.parentId !== null) {
         const parentNote = stateRef.current.notes.find((n) => n.id === note.parentId);
         if (parentNote) {
           const noteBeat = getBeatAtTime(note.time, sortedChanges);

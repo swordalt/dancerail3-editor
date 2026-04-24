@@ -12,7 +12,7 @@ export interface Note {
   type: number;
   width: number;
   parentId: number | null;
-  speed?: number;
+  speed?: string;
 }
 
 export interface BpmChange {

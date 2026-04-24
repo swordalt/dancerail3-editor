@@ -105,6 +105,7 @@ export default function Editor({
     songIllustration: null as File | null,
   });
   const [illustrationPreview, setIllustrationPreview] = useState<string | null>(null);
+  const shouldOmitParentForType = (type: number) => HOLD_START_TYPES.includes(type);
 
   useEffect(() => {
     if (formData.songIllustration) {
@@ -862,7 +863,7 @@ export default function Editor({
 
     // Draw hold connections before note bodies so linked notes render on top.
     stateRef.current.notes.forEach(note => {
-      if (!HOLD_CONNECTOR_TYPES.includes(note.type) || note.parentId === null) {
+      if (!HOLD_CONNECTOR_TYPES.includes(note.type) || HOLD_START_TYPES.includes(note.type) || note.parentId === null) {
         return;
       }
 
@@ -1503,8 +1504,13 @@ export default function Editor({
   const updateSelectedNote = (updates: Partial<Note>) => {
     if (!selectedSingleNote) return;
 
+    const nextType = updates.type ?? selectedSingleNote.type;
+    const normalizedUpdates = shouldOmitParentForType(nextType)
+      ? { ...updates, parentId: null }
+      : updates;
+
     setNotes(prev => prev.map(note => (
-      note.id === selectedSingleNote.id ? { ...note, ...updates } : note
+      note.id === selectedSingleNote.id ? { ...note, ...normalizedUpdates } : note
     )));
   };
   const jumpToNoteTime = (time: number) => {
@@ -1809,7 +1815,7 @@ export default function Editor({
                   <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2">Current Parent</div>
                   <input
                     type="number"
-                    min="1"
+                    min="0"
                     value={currentParentInput}
                     placeholder="Auto"
                     className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none"
@@ -2190,6 +2196,7 @@ export default function Editor({
                       type="number"
                       min="1"
                       max="8"
+                      step="0.01"
                       value={selectedSingleNote.lane + 1}
                       className={notePropertyInputClass}
                       onChange={(e) => {
@@ -2205,6 +2212,7 @@ export default function Editor({
                       type="number"
                       min="1"
                       max="16"
+                      step="0.01"
                       value={selectedSingleNote.width}
                       className={notePropertyInputClass}
                       onChange={(e) => {
@@ -2219,13 +2227,13 @@ export default function Editor({
                     <div className="flex gap-2">
                       <input
                         type="number"
-                        min="1"
+                        min="0"
                         value={selectedSingleNote.parentId ?? ''}
                         placeholder="None"
                         className={notePropertyInputClass}
                         onChange={(e) => {
                           const value = e.target.value.trim();
-                          updateSelectedNote({ parentId: value === '' ? null : Math.max(1, Number(value) || 1) });
+                          updateSelectedNote({ parentId: value === '' ? null : Math.max(0, Number(value) || 0) });
                         }}
                       />
                       <button
@@ -2246,14 +2254,13 @@ export default function Editor({
                   <label className="block">
                     <span className="mb-1 block text-xs text-neutral-400">Speed</span>
                     <input
-                      type="number"
-                      step="0.01"
+                      type="text"
                       value={selectedSingleNote.speed ?? ''}
                       placeholder="Default"
                       className={notePropertyInputClass}
                       onChange={(e) => {
-                        const value = e.target.value.trim();
-                        updateSelectedNote({ speed: value === '' ? undefined : Number(value) || 0 });
+                        const value = e.target.value.replace(/\s+/g, '');
+                        updateSelectedNote({ speed: value === '' ? undefined : value });
                       }}
                     />
                   </label>

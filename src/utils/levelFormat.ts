@@ -1,4 +1,5 @@
 import type { BpmChange, Note, ProjectData, SpeedChange } from '../types/editorTypes';
+import { HOLD_START_TYPES } from '../constants/editorConstants';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat } from './editorUtils';
 
 interface ParsedLevelData {
@@ -16,13 +17,15 @@ export function parseLevelText(text: string): ParsedLevelData {
   let offset = 0;
 
   for (const [index, line] of lines.entries()) {
-    if (line.startsWith('#OFFSET=')) {
-      offset = parseFloat(line.split('=')[1]) * 1000;
+    const normalizedLine = line.trim();
+
+    if (normalizedLine.startsWith('#OFFSET=')) {
+      offset = parseFloat(normalizedLine.split('=')[1]) * 1000;
       continue;
     }
 
-    if (line.startsWith('#BPM [')) {
-      const match = line.match(/#BPM \[(\d+)\]=(\d+\.?\d*);/);
+    if (normalizedLine.startsWith('#BPM [')) {
+      const match = normalizedLine.match(/#BPM \[(\d+)\]=(\d+\.?\d*);/);
       if (match) {
         bpmChanges.push({
           measure: 0,
@@ -34,9 +37,9 @@ export function parseLevelText(text: string): ParsedLevelData {
       continue;
     }
 
-    if (line.startsWith('#SC [')) {
-      const match = line.match(/#SC \[(\d+)\]=(\d+\.?\d*);/);
-      const sciMatch = lines[index + 1]?.match(/#SCI\[(\d+)\]=(\d+\.?\d*);/);
+    if (normalizedLine.startsWith('#SC [')) {
+      const match = normalizedLine.match(/#SC \[(\d+)\]=(\d+\.?\d*);/);
+      const sciMatch = lines[index + 1]?.trim().match(/#SCI\[(\d+)\]=(\d+\.?\d*);/);
       if (match && sciMatch) {
         const speedChange = parseFloat(match[2]);
         const sci = parseFloat(sciMatch[2]);
@@ -49,22 +52,26 @@ export function parseLevelText(text: string): ParsedLevelData {
       continue;
     }
 
-    if (!line.startsWith('<')) {
+    if (!normalizedLine.startsWith('<')) {
       continue;
     }
 
-    const parts = line.match(/<(\d+)><(\d+)><(\d+\.?\d*)><(-?\d+)><(\d+)><(\d+)><(-?\d+)>/);
-    if (!parts) {
+    const columns = [...normalizedLine.matchAll(/<([^>]*)>/g)].map((match) => match[1]);
+    if (columns.length < 7) {
       continue;
     }
 
-    const id = parseInt(parts[1], 10);
-    const type = parseInt(parts[2], 10);
-    const beatPos = parseFloat(parts[3]);
-    const lane = parseInt(parts[4], 10) / 2;
-    const width = parseInt(parts[5], 10);
-    const speed = parseFloat(parts[6]);
-    const parsedParentId = parseInt(parts[7], 10);
+    const id = parseInt(columns[0], 10);
+    const type = parseInt(columns[1], 10);
+    const beatPos = parseFloat(columns[2]);
+    const lane = parseFloat(columns[3]) / 2;
+    const width = parseFloat(columns[4]);
+    const speed = columns[5].replace(/\s+/g, '');
+    const parsedParentId = parseInt(columns[6], 10);
+
+    if ([id, type, beatPos, lane, width, parsedParentId].some((value) => Number.isNaN(value)) || speed === '') {
+      continue;
+    }
 
     const timedBpmChanges = convertBpmChangesToTime(
       bpmChanges.length > 0
@@ -79,7 +86,7 @@ export function parseLevelText(text: string): ParsedLevelData {
       type,
       width,
       speed,
-      parentId: parsedParentId > 0 ? parsedParentId : null,
+      parentId: parsedParentId >= 0 ? parsedParentId : null,
     });
   }
 
@@ -94,6 +101,17 @@ export function buildLevelText(params: {
   offset: string | number;
 }): string {
   const { projectData, notes, bpmChanges, speedChanges, offset } = params;
+  const formatNoteValue = (value: number) => Number(value.toFixed(3)).toString();
+  const getSerializedParentId = (note: Note) => (HOLD_START_TYPES.includes(note.type) ? 0 : (note.parentId ?? 0));
+  const getSerializedSpeed = (note: Note) => {
+    const normalizedSpeed = note.speed?.replace(/\s+/g, '');
+    if (!normalizedSpeed) {
+      return '1';
+    }
+
+    const numericSpeed = Number(normalizedSpeed);
+    return Number.isFinite(numericSpeed) ? formatNoteValue(numericSpeed) : normalizedSpeed;
+  };
 
   let content = `#OFFSET=${parseFloat(offset.toString()) / 1000};\n`;
   content += '#BEAT=1;\n';
@@ -130,7 +148,7 @@ export function buildLevelText(params: {
     }
 
     const beatInMeasure = totalBeats - currentMeasureBeat;
-    content += `<${note.id}><${note.type}><${(measureCount + beatInMeasure / currentBeatsPerMeasure).toFixed(3)}><${note.lane * 2}><${note.width}><1><${note.parentId || 0}>\n`;
+    content += `<${note.id}><${note.type}><${(measureCount + beatInMeasure / currentBeatsPerMeasure).toFixed(3)}><${formatNoteValue(note.lane * 2)}><${formatNoteValue(note.width)}><${getSerializedSpeed(note)}><${getSerializedParentId(note)}>\n`;
   });
 
   return content;
