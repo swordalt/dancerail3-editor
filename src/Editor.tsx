@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowLeft, Settings, Play, Pause, Save, X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { ArrowLeft, Settings, Play, Pause, Save, X, ChevronLeft, ChevronRight, Grid2x2, Grid2x2X } from 'lucide-react';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from './utils/editorUtils';
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
@@ -64,15 +64,6 @@ interface PendingDragUpdate {
   time: number;
 }
 
-const getPreviousHoldConnectorId = (notes: Note[], time: number) => {
-  const previousHoldConnector = notes
-    .filter(note => HOLD_CONNECTOR_TYPES.includes(note.type) && note.time < time)
-    .sort((a, b) => (a.time - b.time) || (a.id - b.id))
-    .at(-1);
-
-  return previousHoldConnector?.id ?? null;
-};
-
 const getNoteIdGroupKey = (note: Note, noteBeat: number) => {
   const centerPosition = note.lane + note.width / 4;
   return `${noteBeat.toFixed(6)}:${centerPosition.toFixed(6)}`;
@@ -128,6 +119,7 @@ export default function Editor({
   const [tapSoundVolume, setTapSoundVolume] = useState(1);
   const [flickSoundVolume, setFlickSoundVolume] = useState(1);
   const [gridZoom, setGridZoom] = useState(1);
+  const [isXPositionGridEnabled, setIsXPositionGridEnabled] = useState(true);
   const [pixelsPerBeat, setPixelsPerBeat] = useState(DEFAULT_PIXELS_PER_BEAT);
   const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'speedChanges' | 'curveSC' | 'history' | 'bpmTiming'>('main');
   const [isLeftPanelCompact, setIsLeftPanelCompact] = useState(false);
@@ -725,7 +717,8 @@ export default function Editor({
         setIsShiftHeld(true);
       }
 
-      if (e.key === 'Delete') {
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
         setNotes(prev => prev.filter(n => !selectedNoteIds.includes(n.id)));
         setSelectedNoteIds([]);
         setDraggingNoteId(null);
@@ -966,16 +959,18 @@ export default function Editor({
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.fillRect(startX, 0, gridWidth, height);
 
-    // Draw lanes
-    ctx.strokeStyle = '#333';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= lanes; i++) {
-      const x = startX + i * laneWidth;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, height);
-      ctx.stroke();
-      objectCount += 1;
+    // Draw x-position lanes when snap is enabled.
+    if (isXPositionGridEnabled) {
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= lanes; i++) {
+        const x = startX + i * laneWidth;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+        objectCount += 1;
+      }
     }
 
     // Draw beats
@@ -1322,7 +1317,7 @@ export default function Editor({
     objectCount += 1;
     renderedObjectsRef.current = objectCount;
 
-  }, [pixelsPerBeat, projectData, gridZoom, hoverPreview, isCtrlHeld, isShiftHeld, noteWidth, selectedNoteIdSet, selectedNoteType, selectionBox, timedBpmChanges, noteRenderIndex, offset]);
+  }, [pixelsPerBeat, projectData, gridZoom, isXPositionGridEnabled, hoverPreview, isCtrlHeld, isShiftHeld, noteWidth, selectedNoteIdSet, selectedNoteType, selectionBox, timedBpmChanges, noteRenderIndex, offset]);
 
   const shouldAnimateCanvas = isPlaying || (!!hoverPreview && !isCtrlHeld && !isShiftHeld);
 
@@ -1416,6 +1411,21 @@ export default function Editor({
     };
   }, [drawGrid, shouldAnimateCanvas, update]);
 
+  const getLaneFromCanvasX = (
+    canvasX: number,
+    gridStartX: number,
+    laneWidth: number,
+    laneCount: number,
+  ) => {
+    const rawLane = (canvasX - gridStartX) / laneWidth;
+
+    if (isXPositionGridEnabled) {
+      return Math.max(0, Math.min(laneCount - 0.5, Math.round(rawLane * 2) / 2));
+    }
+
+    return Number(Math.max(0, Math.min(laneCount, rawLane)).toFixed(3));
+  };
+
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas || !projectData) return;
@@ -1480,17 +1490,24 @@ export default function Editor({
       }
 
       if (clickX >= startX && clickX < startX + gridWidth) {
-        const lane = Math.floor((clickX - startX) / laneWidth);
+        const lane = getLaneFromCanvasX(clickX, startX, laneWidth, lanes);
         const newId = nextNoteIdRef.current++;
         const isHoldConnector = HOLD_CONNECTOR_TYPES.includes(selectedNoteType);
         const isHoldStart = HOLD_START_TYPES.includes(selectedNoteType);
         setNotes(prev => {
+          const currentId = Math.max(newId - 1, 0);
+          const manualParentInputId =
+            currentParentInput.trim() === '' ? null : parseInt(currentParentInput, 10);
           const manualParentId =
-            currentParentNote && prev.some(note => note.id === currentParentNote.id)
-              ? currentParentNote.id
+            manualParentInputId !== null
+            && !Number.isNaN(manualParentInputId)
+            && prev.some(note => note.id === manualParentInputId)
+              ? manualParentInputId
               : null;
           const autoParentId = isHoldConnector && !isHoldStart
-            ? getPreviousHoldConnectorId(prev, snappedTime)
+            ? currentId > 0 && prev.some(note => note.id === currentId)
+              ? currentId
+              : null
             : null;
           const parentId = isHoldConnector && !isHoldStart
             ? manualParentId ?? autoParentId
@@ -1499,7 +1516,7 @@ export default function Editor({
           return [...prev, { id: newId, time: snappedTime, lane, type: selectedNoteType, width: noteWidth, parentId }];
         });
 
-        if (isHoldConnector && currentParentInput.trim() !== '') {
+        if (currentParentInput.trim() !== '') {
           setCurrentParentInput(newId.toString());
         }
       }
@@ -1540,7 +1557,7 @@ export default function Editor({
     const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
 
     if (draggingNoteId) {
-      const lane = Math.floor((clickX - startX) / laneWidth);
+      const lane = getLaneFromCanvasX(clickX, startX, laneWidth, lanes);
       const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
       
       const snap = gridZoom;
@@ -1579,8 +1596,7 @@ export default function Editor({
         setHoverPreview(null);
       }
     } else if (clickX >= startX && clickX < startX + gridWidth) {
-      let lane = Math.floor((clickX - startX) / laneWidth);
-      lane = Math.max(0, Math.min(lanes - 1, lane));
+      const lane = getLaneFromCanvasX(clickX, startX, laneWidth, lanes);
 
       const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
       const snappedBeat = Math.round(clickBeat * gridZoom) / gridZoom;
@@ -1750,16 +1766,18 @@ export default function Editor({
     }
   };
 
+  const currentId = Math.max(nextNoteIdRef.current - 1, 0);
   const currentParentId =
-    currentParentInput.trim() === '' ? null : parseInt(currentParentInput, 10);
+    currentParentInput.trim() === '' ? currentId : parseInt(currentParentInput, 10);
   const currentParentNote =
-    currentParentId === null || Number.isNaN(currentParentId)
+    currentParentId === 0 || Number.isNaN(currentParentId)
       ? null
       : notes.find((note) => note.id === currentParentId) || null;
   const selectedSingleNote =
     selectedNoteIds.length === 1
       ? notes.find((note) => note.id === selectedNoteIds[0]) || null
       : null;
+  const canUseSelectedAsParent = selectedNoteIds.length === 1 && selectedSingleNote !== null;
   const selectedParentNote =
     selectedSingleNote?.parentId === null || selectedSingleNote?.parentId === undefined
       ? null
@@ -2127,29 +2145,41 @@ export default function Editor({
         <div className="flex-1 flex items-center justify-center px-4 max-w-xl gap-3">
           {projectData && (
             <>
-              <button 
-                onClick={togglePlay}
-                className={`shrink-0 p-2 rounded-lg transition-colors ${isPlaying ? 'bg-emerald-500/20 text-emerald-400' : 'hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400'}`} 
-                title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+              <button
+                type="button"
+                onClick={() => setIsXPositionGridEnabled(prev => !prev)}
+                className={`shrink-0 p-2 rounded-lg transition-colors ${isXPositionGridEnabled ? 'hover:bg-neutral-800 text-neutral-400 hover:text-white' : 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30'}`}
+                title={isXPositionGridEnabled ? 'Disable x-position grid' : 'Enable x-position grid'}
+                aria-pressed={!isXPositionGridEnabled}
+                aria-label={isXPositionGridEnabled ? 'Disable x-position grid' : 'Enable x-position grid'}
               >
-                {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                {isXPositionGridEnabled ? <Grid2x2 className="w-4 h-4" /> : <Grid2x2X className="w-4 h-4" />}
               </button>
-              <input 
-                ref={progressBarRef}
-                type="range" 
-                min={0} 
-                max={duration || 100} 
-                step={0.01}
-                defaultValue={0}
-                onMouseDown={() => { isDraggingProgress.current = true; }}
-                onMouseUp={() => { isDraggingProgress.current = false; }}
-                onTouchStart={() => { isDraggingProgress.current = true; }}
-                onTouchEnd={() => { isDraggingProgress.current = false; }}
-                onChange={handleSeekChange}
-                className="min-w-0 flex-1 h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-              />
-              <div ref={timeDisplayRef} className="shrink-0 text-sm font-mono text-neutral-400">
-                {formatTime(currentTime, convertBpmChangesToTime(bpmChanges))}
+              <div className="flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-neutral-800 bg-neutral-950/40 px-2 py-1.5">
+                <button
+                  onClick={togglePlay}
+                  className={`shrink-0 p-2 rounded-lg transition-colors ${isPlaying ? 'bg-emerald-500/20 text-emerald-400' : 'hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400'}`}
+                  title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+                >
+                  {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                </button>
+                <input
+                  ref={progressBarRef}
+                  type="range"
+                  min={0}
+                  max={duration || 100}
+                  step={0.01}
+                  defaultValue={0}
+                  onMouseDown={() => { isDraggingProgress.current = true; }}
+                  onMouseUp={() => { isDraggingProgress.current = false; }}
+                  onTouchStart={() => { isDraggingProgress.current = true; }}
+                  onTouchEnd={() => { isDraggingProgress.current = false; }}
+                  onChange={handleSeekChange}
+                  className="min-w-0 flex-1 h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                />
+                <div ref={timeDisplayRef} className="shrink-0 text-sm font-mono text-neutral-400">
+                  {formatTime(currentTime, convertBpmChangesToTime(bpmChanges))}
+                </div>
               </div>
             </>
           )}
@@ -2260,7 +2290,7 @@ export default function Editor({
                     {currentParentNote
                       ? `ID ${currentParentNote.id} | Lane ${currentParentNote.lane + 1} | Type ${NOTE_TYPES[currentParentNote.type]?.name || currentParentNote.type}`
                       : currentParentInput.trim() === ''
-                        ? 'Auto-select previous note when placing.'
+                        ? 'Auto-select current ID when placing.'
                         : 'No note exists with that ID.'}
                   </div>
                   <div className="flex gap-2 mt-2">
@@ -2276,14 +2306,14 @@ export default function Editor({
                           setCurrentParentInput(selectedSingleNote.id.toString());
                         }
                       }}
-                      disabled={!selectedSingleNote}
+                      disabled={!canUseSelectedAsParent}
                       className="flex-1 px-2 py-1.5 text-xs text-neutral-300 bg-neutral-800 hover:bg-neutral-700 disabled:bg-neutral-900 disabled:text-neutral-600 rounded transition-colors"
                     >
                       Use Selected
                     </button>
                   </div>
                   <div className="text-xs text-neutral-500 mt-2">
-                    Current ID: {Math.max(nextNoteIdRef.current - 1, 0)}
+                    Current ID: {currentId}
                   </div>
                 </div>
 

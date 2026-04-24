@@ -73,7 +73,7 @@ export function parseLevelText(text: string): ParsedLevelData {
     }
 
     if (normalizedLine.startsWith('#SC [')) {
-      const match = normalizedLine.match(/#SC \[(\d+)\]=(\d+\.?\d*);/);
+      const match = normalizedLine.match(/#SC \[(\d+)\]=(-?\d+\.?\d*);/);
       const sciMatch = lines[index + 1]?.trim().match(/#SCI\[(\d+)\]=(\d+\.?\d*);/);
       if (match && sciMatch) {
         const speedChange = parseFloat(match[2]);
