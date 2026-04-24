@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowLeft, Settings, Play, Pause, Save, X, ChevronLeft, ChevronRight, Grid2x2, Grid2x2X } from 'lucide-react';
+import { ArrowLeft, Settings, Play, Pause, Download, X, ChevronLeft, ChevronRight, Grid2x2, Grid2x2X } from 'lucide-react';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from './utils/editorUtils';
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
 import { NOTE_TYPES, AVAILABLE_NOTE_TYPES, HOLD_CONNECTOR_TYPES, HOLD_CENTER_TYPES, HOLD_END_TYPES, HOLD_START_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from './constants/editorConstants';
 import type { BpmChange, EditorFormData, EditorMode, Note, ProjectData, SelectionBox, SpeedChange } from './types/editorTypes';
 import { buildLevelText } from './utils/levelFormat';
+import { createZipBlob } from './utils/zipExport';
 
 const HIT_SOUND_URL = new URL('../hit.ogg', import.meta.url).href;
 const FLICK_SOUND_URL = new URL('../flick.ogg', import.meta.url).href;
@@ -20,10 +21,115 @@ const HOVER_PREVIEW_FRAME_INTERVAL_MS = 1000 / 30;
 const AUDIO_CLOCK_HANDOFF_DELAY_MS = 200;
 const AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS = 0.05;
 const AUDIO_SEEK_TIMEOUT_MS = 10000;
+const DEFAULT_PIXELS_PER_BEAT = 150;
+const MIN_PIXELS_PER_BEAT = 60;
+const MAX_PIXELS_PER_BEAT = 320;
+const EDITOR_SETTINGS_STORAGE_KEY = 'dancerail3-editor:settings';
+const SIDE_PANEL_TRANSITION_MS = 300;
+
+const getFileExtension = (file: File) => {
+  const extension = file.name.split('.').pop();
+  return extension && extension !== file.name ? extension : 'bin';
+};
+
+interface EditorSettings {
+  isExitWarningEnabled: boolean;
+  isScrollDirectionInverted: boolean;
+  musicVolume: number;
+  tapSoundVolume: number;
+  flickSoundVolume: number;
+  gridZoom: number;
+  isXPositionGridEnabled: boolean;
+  pixelsPerBeat: number;
+}
+
+const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
+  isExitWarningEnabled: true,
+  isScrollDirectionInverted: false,
+  musicVolume: 1,
+  tapSoundVolume: 1,
+  flickSoundVolume: 1,
+  gridZoom: 1,
+  isXPositionGridEnabled: true,
+  pixelsPerBeat: DEFAULT_PIXELS_PER_BEAT,
+};
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+);
+
+const isValidVolume = (value: unknown): value is number => (
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 2
+);
+
+const isValidGridZoom = (value: unknown): value is number => (
+  typeof value === 'number' &&
+  Number.isInteger(value) &&
+  (value === 1 || (value >= 4 && value % 4 === 0))
+);
+
+const isValidPixelsPerBeat = (value: unknown): value is number => (
+  typeof value === 'number' &&
+  Number.isInteger(value) &&
+  value >= MIN_PIXELS_PER_BEAT &&
+  value <= MAX_PIXELS_PER_BEAT
+);
+
+const loadEditorSettings = (): EditorSettings => {
+  if (typeof window === 'undefined') return DEFAULT_EDITOR_SETTINGS;
+
+  try {
+    const storedSettings = window.localStorage.getItem(EDITOR_SETTINGS_STORAGE_KEY);
+    if (!storedSettings) return DEFAULT_EDITOR_SETTINGS;
+
+    const parsedSettings: unknown = JSON.parse(storedSettings);
+    if (!isPlainRecord(parsedSettings)) return DEFAULT_EDITOR_SETTINGS;
+
+    return {
+      isExitWarningEnabled: typeof parsedSettings.isExitWarningEnabled === 'boolean'
+        ? parsedSettings.isExitWarningEnabled
+        : DEFAULT_EDITOR_SETTINGS.isExitWarningEnabled,
+      isScrollDirectionInverted: typeof parsedSettings.isScrollDirectionInverted === 'boolean'
+        ? parsedSettings.isScrollDirectionInverted
+        : DEFAULT_EDITOR_SETTINGS.isScrollDirectionInverted,
+      musicVolume: isValidVolume(parsedSettings.musicVolume)
+        ? parsedSettings.musicVolume
+        : DEFAULT_EDITOR_SETTINGS.musicVolume,
+      tapSoundVolume: isValidVolume(parsedSettings.tapSoundVolume)
+        ? parsedSettings.tapSoundVolume
+        : DEFAULT_EDITOR_SETTINGS.tapSoundVolume,
+      flickSoundVolume: isValidVolume(parsedSettings.flickSoundVolume)
+        ? parsedSettings.flickSoundVolume
+        : DEFAULT_EDITOR_SETTINGS.flickSoundVolume,
+      gridZoom: isValidGridZoom(parsedSettings.gridZoom)
+        ? parsedSettings.gridZoom
+        : DEFAULT_EDITOR_SETTINGS.gridZoom,
+      isXPositionGridEnabled: typeof parsedSettings.isXPositionGridEnabled === 'boolean'
+        ? parsedSettings.isXPositionGridEnabled
+        : DEFAULT_EDITOR_SETTINGS.isXPositionGridEnabled,
+      pixelsPerBeat: isValidPixelsPerBeat(parsedSettings.pixelsPerBeat)
+        ? parsedSettings.pixelsPerBeat
+        : DEFAULT_EDITOR_SETTINGS.pixelsPerBeat,
+    };
+  } catch {
+    return DEFAULT_EDITOR_SETTINGS;
+  }
+};
+
+const saveEditorSettings = (settings: EditorSettings) => {
+  if (typeof window === 'undefined') return;
+
+  try {
+    window.localStorage.setItem(EDITOR_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // Storage can be unavailable in private browsing or restricted iframe contexts.
+  }
+};
 
 interface EditorProps {
   onBack: () => void;
   mode?: EditorMode;
+  initialProjectData?: ProjectData | null;
   notes: Note[];
   setNotes: React.Dispatch<React.SetStateAction<Note[]>>;
   bpmChanges: BpmChange[];
@@ -64,6 +170,18 @@ interface PendingDragUpdate {
   time: number;
 }
 
+type OperationCategory = 'note' | 'timing' | 'speed' | 'metadata';
+
+interface OperationHistoryEntry {
+  id: number;
+  timestamp: number;
+  category: OperationCategory;
+  title: string;
+  detail: string;
+}
+
+const MAX_OPERATION_HISTORY_ENTRIES = 500;
+
 const getNoteIdGroupKey = (note: Note, noteBeat: number) => {
   const centerPosition = note.lane + note.width / 4;
   return `${noteBeat.toFixed(6)}:${centerPosition.toFixed(6)}`;
@@ -95,9 +213,149 @@ const formatGroupedIds = (ids: number[]) => {
   return segments.join(',');
 };
 
+const formatHistoryTimestamp = (timestamp: number) => (
+  new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(timestamp)
+);
+
+const formatHistoryNumber = (value: number) => (
+  Number.isInteger(value) ? value.toString() : Number(value.toFixed(3)).toString()
+);
+
+const formatMaybeValue = (value: unknown) => (
+  value === undefined || value === null || value === '' ? 'None' : String(value)
+);
+
+const formatNoteName = (note: Note) => NOTE_TYPES[note.type]?.name || `Type ${note.type}`;
+const formatNoteLane = (lane: number) => formatHistoryNumber(lane + 1);
+const formatTimingPosition = (measure: number, beat: number) => (
+  `Measure ${measure}, Beat ${beat}`
+);
+
+const operationCategoryStyles: Record<OperationCategory, string> = {
+  note: 'border-sky-500/30 bg-sky-500/10 text-sky-200',
+  timing: 'border-amber-500/30 bg-amber-500/10 text-amber-200',
+  speed: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200',
+  metadata: 'border-violet-500/30 bg-violet-500/10 text-violet-200',
+};
+
+interface VirtualizedChangeListProps<T> {
+  items: T[];
+  rowHeight: number;
+  overscan?: number;
+  className?: string;
+  getKey: (item: T, index: number) => React.Key;
+  renderRow: (item: T, index: number, style: React.CSSProperties) => React.ReactNode;
+}
+
+function VirtualizedChangeList<T>({
+  items,
+  rowHeight,
+  overscan = 6,
+  className = '',
+  getKey,
+  renderRow,
+}: VirtualizedChangeListProps<T>) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    const updateViewportHeight = () => setViewportHeight(viewport.clientHeight);
+    updateViewportHeight();
+
+    const resizeObserver = new ResizeObserver(updateViewportHeight);
+    resizeObserver.observe(viewport);
+
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  const totalHeight = items.length * rowHeight;
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const endIndex = Math.min(
+    items.length,
+    Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan
+  );
+  const visibleItems = items.slice(startIndex, endIndex);
+
+  return (
+    <div
+      ref={viewportRef}
+      className={`relative overflow-y-auto ${className}`}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      <div className="relative" style={{ height: totalHeight }}>
+        {visibleItems.map((item, visibleIndex) => {
+          const index = startIndex + visibleIndex;
+
+          return (
+            <React.Fragment key={getKey(item, index)}>
+              {renderRow(item, index, {
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                height: rowHeight,
+                transform: `translateY(${index * rowHeight}px)`,
+              })}
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+interface CommitInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'defaultValue' | 'onChange' | 'onBlur' | 'onKeyDown'> {
+  value: string | number;
+  onCommit: (value: string) => void;
+}
+
+function CommitInput({ value, onCommit, ...inputProps }: CommitInputProps) {
+  const [draftValue, setDraftValue] = useState(String(value ?? ''));
+  const lastCommittedDraftRef = useRef(String(value ?? ''));
+
+  useEffect(() => {
+    const nextValue = String(value ?? '');
+    setDraftValue(nextValue);
+    lastCommittedDraftRef.current = nextValue;
+  }, [value]);
+
+  const commitDraft = () => {
+    if (draftValue === lastCommittedDraftRef.current) {
+      return;
+    }
+
+    lastCommittedDraftRef.current = draftValue;
+    onCommit(draftValue);
+  };
+
+  return (
+    <input
+      {...inputProps}
+      value={draftValue}
+      onChange={(event) => setDraftValue(event.target.value)}
+      onBlur={commitDraft}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          commitDraft();
+          event.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
 export default function Editor({ 
   onBack, 
   mode,
+  initialProjectData = null,
   notes,
   setNotes,
   bpmChanges,
@@ -107,23 +365,24 @@ export default function Editor({
   offset,
   setOffset
 }: EditorProps) {
-  const DEFAULT_PIXELS_PER_BEAT = 150;
-  const MIN_PIXELS_PER_BEAT = 60;
-  const MAX_PIXELS_PER_BEAT = 320;
+  const initialEditorSettings = useMemo(loadEditorSettings, []);
   const [isModalOpen, setIsModalOpen] = useState(mode === 'new');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [isExitWarningOpen, setIsExitWarningOpen] = useState(false);
-  const [isExitWarningEnabled, setIsExitWarningEnabled] = useState(true);
-  const [isScrollDirectionInverted, setIsScrollDirectionInverted] = useState(false);
-  const [musicVolume, setMusicVolume] = useState(1);
-  const [tapSoundVolume, setTapSoundVolume] = useState(1);
-  const [flickSoundVolume, setFlickSoundVolume] = useState(1);
-  const [gridZoom, setGridZoom] = useState(1);
-  const [isXPositionGridEnabled, setIsXPositionGridEnabled] = useState(true);
-  const [pixelsPerBeat, setPixelsPerBeat] = useState(DEFAULT_PIXELS_PER_BEAT);
+  const [isExitWarningEnabled, setIsExitWarningEnabled] = useState(initialEditorSettings.isExitWarningEnabled);
+  const [isScrollDirectionInverted, setIsScrollDirectionInverted] = useState(initialEditorSettings.isScrollDirectionInverted);
+  const [musicVolume, setMusicVolume] = useState(initialEditorSettings.musicVolume);
+  const [tapSoundVolume, setTapSoundVolume] = useState(initialEditorSettings.tapSoundVolume);
+  const [flickSoundVolume, setFlickSoundVolume] = useState(initialEditorSettings.flickSoundVolume);
+  const [gridZoom, setGridZoom] = useState(initialEditorSettings.gridZoom);
+  const [isXPositionGridEnabled, setIsXPositionGridEnabled] = useState(initialEditorSettings.isXPositionGridEnabled);
+  const [pixelsPerBeat, setPixelsPerBeat] = useState(initialEditorSettings.pixelsPerBeat);
   const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'speedChanges' | 'curveSC' | 'history' | 'bpmTiming'>('main');
   const [isLeftPanelCompact, setIsLeftPanelCompact] = useState(false);
   const [isRightPanelCompact, setIsRightPanelCompact] = useState(false);
+  const [isLeftPanelContentVisible, setIsLeftPanelContentVisible] = useState(true);
+  const [isRightPanelContentVisible, setIsRightPanelContentVisible] = useState(true);
   const [selectedNoteType, setSelectedNoteType] = useState<number>(1);
   const [noteWidth, setNoteWidth] = useState(4);
   const [currentParentInput, setCurrentParentInput] = useState('');
@@ -133,7 +392,9 @@ export default function Editor({
   const [selectedNoteIds, setSelectedNoteIds] = useState<number[]>([]);
   const [draggingNoteId, setDraggingNoteId] = useState<number | null>(null);
   const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
+  const [operationHistory, setOperationHistory] = useState<OperationHistoryEntry[]>([]);
   const nextNoteIdRef = useRef<number>(1);
+  const nextOperationHistoryIdRef = useRef<number>(1);
   const lastPlayedTimeRef = useRef<number>(0);
   const [formData, setFormData] = useState<EditorFormData>({
     songId: '',
@@ -149,6 +410,64 @@ export default function Editor({
   const shouldOmitParentForType = (type: number) => !canTypeHaveParent(type);
 
   useEffect(() => {
+    if (isLeftPanelCompact) {
+      setIsLeftPanelContentVisible(false);
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setIsLeftPanelContentVisible(true);
+    }, SIDE_PANEL_TRANSITION_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [isLeftPanelCompact]);
+
+  useEffect(() => {
+    if (isRightPanelCompact) {
+      setIsRightPanelContentVisible(false);
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setIsRightPanelContentVisible(true);
+    }, SIDE_PANEL_TRANSITION_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [isRightPanelCompact]);
+
+  const toggleLeftPanelCompact = () => {
+    setIsLeftPanelContentVisible(false);
+    setIsLeftPanelCompact(current => !current);
+  };
+
+  const toggleRightPanelCompact = () => {
+    setIsRightPanelContentVisible(false);
+    setIsRightPanelCompact(current => !current);
+  };
+
+  useEffect(() => {
+    saveEditorSettings({
+      isExitWarningEnabled,
+      isScrollDirectionInverted,
+      musicVolume,
+      tapSoundVolume,
+      flickSoundVolume,
+      gridZoom,
+      isXPositionGridEnabled,
+      pixelsPerBeat,
+    });
+  }, [
+    isExitWarningEnabled,
+    isScrollDirectionInverted,
+    musicVolume,
+    tapSoundVolume,
+    flickSoundVolume,
+    gridZoom,
+    isXPositionGridEnabled,
+    pixelsPerBeat,
+  ]);
+
+  useEffect(() => {
     if (formData.songIllustration) {
       const url = URL.createObjectURL(formData.songIllustration);
       setIllustrationPreview(url);
@@ -158,7 +477,7 @@ export default function Editor({
     }
   }, [formData.songIllustration]);
 
-  const [projectData, setProjectData] = useState<ProjectData | null>(null);
+  const [projectData, setProjectData] = useState<ProjectData | null>(initialProjectData);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -187,6 +506,7 @@ export default function Editor({
   const progressBarRef = useRef<HTMLInputElement>(null);
   const isDraggingProgress = useRef(false);
   const pendingDragUpdateRef = useRef<PendingDragUpdate | null>(null);
+  const dragStartNoteRef = useRef<Note | null>(null);
   const dragUpdateFrameRef = useRef<number>();
   const hoverPreviewRef = useRef<HoverPreview | null>(null);
   const playRequestIdRef = useRef(0);
@@ -294,7 +614,26 @@ export default function Editor({
   }, [notes]);
 
   const timedBpmChanges = useMemo(() => convertBpmChangesToTime(bpmChanges), [bpmChanges]);
+  const hasExportIncompatibleTimeSignature = useMemo(
+    () => bpmChanges.some(change => change.timeSignature.trim() !== '4/4'),
+    [bpmChanges],
+  );
   const selectedNoteIdSet = useMemo(() => new Set(selectedNoteIds), [selectedNoteIds]);
+
+  const recordOperation = useCallback((entry: Omit<OperationHistoryEntry, 'id' | 'timestamp'>) => {
+    const nextEntry: OperationHistoryEntry = {
+      ...entry,
+      id: nextOperationHistoryIdRef.current++,
+      timestamp: Date.now(),
+    };
+
+    setOperationHistory(prev => [nextEntry, ...prev].slice(0, MAX_OPERATION_HISTORY_ENTRIES));
+  }, []);
+
+  const getNoteHistoryDetail = useCallback((note: Note) => {
+    return `${formatNoteName(note)} #${note.id} at ${formatTime(note.time, timedBpmChanges)}, lane ${formatNoteLane(note.lane)}, width ${formatHistoryNumber(note.width)}`;
+  }, [timedBpmChanges]);
+
   const noteRenderIndex = useMemo(() => {
     const notesById = new Map<number, Note>();
     const noteBeats = new Map<number, number>();
@@ -361,6 +700,7 @@ export default function Editor({
   useEffect(() => {
     const handleMouseUp = () => {
       setDraggingNoteId(null);
+      dragStartNoteRef.current = null;
     };
     window.addEventListener('mouseup', handleMouseUp);
     return () => window.removeEventListener('mouseup', handleMouseUp);
@@ -375,6 +715,7 @@ export default function Editor({
   }, []);
 
   const handleConfirm = () => {
+    const wasProjectCreated = !projectData;
     let audioUrl = projectData?.audioUrl || '';
     if (formData.songFile && formData.songFile !== projectData?.songFile) {
       if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -400,6 +741,12 @@ export default function Editor({
     if (activeLeftPanel === 'editInfo') {
       setActiveLeftPanel('main');
     }
+
+    recordOperation({
+      category: 'metadata',
+      title: wasProjectCreated ? 'Created project metadata' : 'Updated chart metadata',
+      detail: `${formData.songName || 'Untitled Project'} | BPM ${formatHistoryNumber(nextBpm)} | Difficulty ${formData.difficulty || 'None'}`,
+    });
   };
 
   const handleEditInfo = () => {
@@ -719,12 +1066,24 @@ export default function Editor({
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
-        setNotes(prev => prev.filter(n => !selectedNoteIds.includes(n.id)));
+        const noteIdsToDelete = new Set(selectedNoteIds);
+        const deletedNotes = stateRef.current.notes.filter(n => noteIdsToDelete.has(n.id));
+        if (deletedNotes.length > 0) {
+          recordOperation({
+            category: 'note',
+            title: deletedNotes.length === 1 ? 'Deleted note' : `Deleted ${deletedNotes.length} notes`,
+            detail: deletedNotes.length === 1
+              ? getNoteHistoryDetail(deletedNotes[0])
+              : `IDs ${formatGroupedIds(deletedNotes.map(note => note.id))}`,
+          });
+        }
+        setNotes(prev => prev.filter(n => !noteIdsToDelete.has(n.id)));
         setSelectedNoteIds([]);
         setDraggingNoteId(null);
         setSelectionBox(null);
         setHoverPreview(null);
         pendingDragUpdateRef.current = null;
+        dragStartNoteRef.current = null;
         return;
       }
 
@@ -805,7 +1164,7 @@ export default function Editor({
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleWindowBlur);
     };
-  }, [togglePlay]);
+  }, [getNoteHistoryDetail, recordOperation, selectedNoteIds, togglePlay]);
 
   const drawGrid = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1486,6 +1845,7 @@ export default function Editor({
       if (e.shiftKey && clickedNote) {
         setSelectedNoteIds([clickedNote.id]);
         setDraggingNoteId(clickedNote.id);
+        dragStartNoteRef.current = clickedNote;
         return;
       }
 
@@ -1494,26 +1854,39 @@ export default function Editor({
         const newId = nextNoteIdRef.current++;
         const isHoldConnector = HOLD_CONNECTOR_TYPES.includes(selectedNoteType);
         const isHoldStart = HOLD_START_TYPES.includes(selectedNoteType);
-        setNotes(prev => {
-          const currentId = Math.max(newId - 1, 0);
-          const manualParentInputId =
-            currentParentInput.trim() === '' ? null : parseInt(currentParentInput, 10);
-          const manualParentId =
-            manualParentInputId !== null
-            && !Number.isNaN(manualParentInputId)
-            && prev.some(note => note.id === manualParentInputId)
-              ? manualParentInputId
-              : null;
-          const autoParentId = isHoldConnector && !isHoldStart
-            ? currentId > 0 && prev.some(note => note.id === currentId)
-              ? currentId
-              : null
+        const currentNotes = stateRef.current.notes;
+        const currentId = Math.max(newId - 1, 0);
+        const manualParentInputId =
+          currentParentInput.trim() === '' ? null : parseInt(currentParentInput, 10);
+        const manualParentId =
+          manualParentInputId !== null
+          && !Number.isNaN(manualParentInputId)
+          && currentNotes.some(note => note.id === manualParentInputId)
+            ? manualParentInputId
             : null;
-          const parentId = isHoldConnector && !isHoldStart
-            ? manualParentId ?? autoParentId
-            : null;
-          
-          return [...prev, { id: newId, time: snappedTime, lane, type: selectedNoteType, width: noteWidth, parentId }];
+        const autoParentId = isHoldConnector && !isHoldStart
+          ? currentId > 0 && currentNotes.some(note => note.id === currentId)
+            ? currentId
+            : null
+          : null;
+        const parentId = isHoldConnector && !isHoldStart
+          ? manualParentId ?? autoParentId
+          : null;
+        const placedNote: Note = {
+          id: newId,
+          time: snappedTime,
+          lane,
+          type: selectedNoteType,
+          width: noteWidth,
+          parentId,
+        };
+
+        setNotes(prev => [...prev, placedNote]);
+
+        recordOperation({
+          category: 'note',
+          title: 'Placed note',
+          detail: `${getNoteHistoryDetail(placedNote)}${parentId === null ? '' : `, parent #${parentId}`}`,
         });
 
         if (currentParentInput.trim() !== '') {
@@ -1524,6 +1897,7 @@ export default function Editor({
       if (e.shiftKey) {
         if (clickedNote) {
           setDraggingNoteId(clickedNote.id);
+          dragStartNoteRef.current = clickedNote;
         }
       } else if (clickedNote) {
         setSelectedNoteIds([clickedNote.id]);
@@ -1533,8 +1907,20 @@ export default function Editor({
       }
     } else if (e.button === 2) { // Right click
       if (clickedNote) {
-        setNotes(prev => prev.filter(n => n.id !== clickedNote.id));
-        setSelectedNoteIds(prev => prev.filter(id => id !== clickedNote.id));
+        const noteIdsToDelete = selectedNoteIdSet.has(clickedNote.id) ? selectedNoteIds : [clickedNote.id];
+        const noteIdsToDeleteSet = new Set(noteIdsToDelete);
+        const deletedNotes = stateRef.current.notes.filter(note => noteIdsToDeleteSet.has(note.id));
+        if (deletedNotes.length > 0) {
+          recordOperation({
+            category: 'note',
+            title: deletedNotes.length === 1 ? 'Deleted note' : `Deleted ${deletedNotes.length} notes`,
+            detail: deletedNotes.length === 1
+              ? getNoteHistoryDetail(deletedNotes[0])
+              : `IDs ${formatGroupedIds(deletedNotes.map(note => note.id))}`,
+          });
+        }
+        setNotes(prev => prev.filter(note => !noteIdsToDeleteSet.has(note.id)));
+        setSelectedNoteIds(prev => prev.filter(id => !noteIdsToDeleteSet.has(id)));
       }
     }
   };
@@ -1627,7 +2013,16 @@ export default function Editor({
       dragUpdateFrameRef.current = undefined;
     }
     const pendingUpdate = pendingDragUpdateRef.current;
+    const dragStartNote = dragStartNoteRef.current;
+    let dragEndNote = dragStartNote
+      ? stateRef.current.notes.find(note => note.id === dragStartNote.id) || null
+      : null;
+
     if (pendingUpdate) {
+      if (dragStartNote && dragStartNote.id === pendingUpdate.noteId) {
+        dragEndNote = { ...dragStartNote, time: pendingUpdate.time, lane: pendingUpdate.lane };
+      }
+
       setNotes((prev) => prev.map((note) => {
         if (note.id !== pendingUpdate.noteId) {
           return note;
@@ -1641,6 +2036,15 @@ export default function Editor({
       }));
       pendingDragUpdateRef.current = null;
     }
+
+    if (dragStartNote && dragEndNote && (dragStartNote.time !== dragEndNote.time || dragStartNote.lane !== dragEndNote.lane)) {
+      recordOperation({
+        category: 'note',
+        title: 'Moved note',
+        detail: `#${dragStartNote.id} from ${formatTime(dragStartNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragStartNote.lane)} to ${formatTime(dragEndNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragEndNote.lane)}`,
+      });
+    }
+    dragStartNoteRef.current = null;
 
     if (selectionBox) {
       const canvas = canvasRef.current;
@@ -1723,47 +2127,116 @@ export default function Editor({
     }
   };
 
-  const saveLevel = async () => {
-    if (!projectData) return;
-    const content = buildLevelText({
-      projectData,
-      notes,
-      bpmChanges,
-      speedChanges,
-      offset,
-    });
-    
-    const fallbackDownload = (content: string) => {
-      const blob = new Blob([content], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${projectData.songId || 'level'}.txt`;
-      a.click();
+  const saveZipBlob = async (zipBlob: Blob, suggestedName: string, errorLabel: string) => {
+    const fallbackDownload = () => {
+      const url = URL.createObjectURL(zipBlob);
+      const anchor = document.createElement('a');
+
+      anchor.href = url;
+      anchor.download = suggestedName;
+      anchor.click();
       URL.revokeObjectURL(url);
     };
 
     if ('showSaveFilePicker' in window) {
       try {
         const handle = await (window as any).showSaveFilePicker({
-          suggestedName: `${projectData.songId || 'level'}.txt`,
+          suggestedName,
           types: [{
-            description: 'Text File',
-            accept: {'text/plain': ['.txt']},
+            description: 'ZIP Archive',
+            accept: { 'application/zip': ['.zip'] },
           }],
         });
         const writable = await handle.createWritable();
-        await writable.write(content);
+        await writable.write(zipBlob);
         await writable.close();
       } catch (err) {
         if ((err as Error).name !== 'AbortError') {
-          console.error('Save failed', err);
-          fallbackDownload(content);
+          console.error(`${errorLabel} export failed`, err);
+          fallbackDownload();
         }
       }
     } else {
-      fallbackDownload(content);
+      fallbackDownload();
     }
+  };
+
+  const getChartText = () => {
+    if (!projectData) return '';
+
+    return buildLevelText({
+      projectData,
+      notes,
+      bpmChanges,
+      speedChanges,
+      offset,
+    });
+  };
+
+  const getFirstBpm = () => {
+    const firstChange = [...bpmChanges]
+      .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat))[0];
+
+    return firstChange?.bpm ?? projectData?.bpm ?? 120;
+  };
+
+  const exportDr3Viewer = async () => {
+    if (!projectData || !projectData.songFile || hasExportIncompatibleTimeSignature) return;
+
+    const songId = projectData.songId || 'level';
+    const difficulty = projectData.difficulty || '0';
+    const entries = [
+      {
+        name: `${songId}.${difficulty}.txt`,
+        data: getChartText(),
+      },
+      {
+        name: `${songId}.${getFileExtension(projectData.songFile)}`,
+        data: projectData.songFile,
+      },
+    ];
+
+    if (projectData.songIllustration) {
+      entries.push({
+        name: `${songId}.${getFileExtension(projectData.songIllustration)}`,
+        data: projectData.songIllustration,
+      });
+    }
+
+    const zipBlob = await createZipBlob(entries);
+    await saveZipBlob(zipBlob, `${songId}.${difficulty}.zip`, 'DR3Viewer');
+  };
+
+  const exportDr3Fp = async () => {
+    if (!projectData || !projectData.songFile || hasExportIncompatibleTimeSignature) return;
+
+    const songId = projectData.songId || 'level';
+    const difficulty = projectData.difficulty || '0';
+    const infoText = `${projectData.songName || ''}\n${projectData.songArtist || ''}\n${getFirstBpm()}\n`;
+    const entries = [
+      {
+        name: 'info.txt',
+        data: infoText,
+      },
+      {
+        name: `${difficulty}.txt`,
+        data: getChartText(),
+      },
+      {
+        name: `base.${getFileExtension(projectData.songFile)}`,
+        data: projectData.songFile,
+      },
+    ];
+
+    if (projectData.songIllustration) {
+      entries.push({
+        name: `base.${getFileExtension(projectData.songIllustration)}`,
+        data: projectData.songIllustration,
+      });
+    }
+
+    const zipBlob = await createZipBlob(entries);
+    await saveZipBlob(zipBlob, `${songId}.zip`, 'DR3FP');
   };
 
   const currentId = Math.max(nextNoteIdRef.current - 1, 0);
@@ -1825,6 +2298,9 @@ export default function Editor({
   };
   const selectedNoteTimepos = selectedSingleNote ? getTimeposFromTime(selectedSingleNote.time) : 0;
   const notePropertyInputClass = 'w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none disabled:cursor-not-allowed disabled:border-neutral-800 disabled:bg-neutral-900 disabled:text-neutral-600';
+  const emptyCanvasMessage = mode === 'import'
+    ? 'Provide the music file in Chart Metadata to start editing this imported chart.'
+    : 'Fill in project details in Chart Metadata to start editing.';
   const updateSelectedNote = (updates: Partial<Note>) => {
     if (!selectedSingleNote) return;
 
@@ -1832,11 +2308,174 @@ export default function Editor({
     const normalizedUpdates = shouldOmitParentForType(nextType)
       ? { ...updates, parentId: null }
       : updates;
+    const changedFields = Object.entries(normalizedUpdates).filter(([key, value]) => (
+      selectedSingleNote[key as keyof Note] !== value
+    ));
+
+    if (changedFields.length === 0) {
+      return;
+    }
+
+    const fieldLabels: Partial<Record<keyof Note, string>> = {
+      time: 'time',
+      lane: 'lane',
+      type: 'type',
+      width: 'width',
+      parentId: 'parent ID',
+      speed: 'speed',
+    };
+    const fieldDetails = changedFields.map(([key, value]) => {
+      const typedKey = key as keyof Note;
+      const label = fieldLabels[typedKey] || key;
+      const previousValue = selectedSingleNote[typedKey];
+
+      if (typedKey === 'time') {
+        return `${label}: ${formatTime(Number(previousValue), timedBpmChanges)} -> ${formatTime(Number(value), timedBpmChanges)}`;
+      }
+
+      if (typedKey === 'lane') {
+        return `${label}: ${formatNoteLane(Number(previousValue))} -> ${formatNoteLane(Number(value))}`;
+      }
+
+      if (typedKey === 'type') {
+        return `${label}: ${NOTE_TYPES[Number(previousValue)]?.name || previousValue} -> ${NOTE_TYPES[Number(value)]?.name || value}`;
+      }
+
+      return `${label}: ${formatMaybeValue(previousValue)} -> ${formatMaybeValue(value)}`;
+    }).join('; ');
+
+    recordOperation({
+      category: 'note',
+      title: 'Modified note',
+      detail: `#${selectedSingleNote.id} ${fieldDetails}`,
+    });
 
     setNotes(prev => prev.map(note => (
       note.id === selectedSingleNote.id ? { ...note, ...normalizedUpdates } : note
     )));
   };
+  const updateBpmChange = (index: number, updates: Partial<BpmChange>) => {
+    const previousChange = bpmChanges[index];
+    if (!previousChange) return;
+
+    const nextChange = { ...previousChange, ...updates };
+    const changedFields = Object.entries(updates).filter(([key, value]) => (
+      previousChange[key as keyof BpmChange] !== value
+    ));
+
+    if (changedFields.length === 0) return;
+
+    setBpmChanges(prev => prev.map((change, changeIndex) => (
+      changeIndex === index ? nextChange : change
+    )));
+
+    recordOperation({
+      category: 'timing',
+      title: 'Modified BPM change',
+      detail: `${formatTimingPosition(previousChange.measure, previousChange.beat)} | ${changedFields.map(([key, value]) => `${key}: ${previousChange[key as keyof BpmChange]} -> ${value}`).join('; ')}`,
+    });
+  };
+
+  const deleteBpmChange = (index: number) => {
+    const deletedChange = bpmChanges[index];
+    if (!deletedChange) return;
+
+    setBpmChanges(prev => prev.filter((_, changeIndex) => changeIndex !== index));
+    recordOperation({
+      category: 'timing',
+      title: 'Deleted BPM change',
+      detail: `${formatTimingPosition(deletedChange.measure, deletedChange.beat)} | BPM ${formatHistoryNumber(deletedChange.bpm)} | ${deletedChange.timeSignature}`,
+    });
+  };
+
+  const addBpmChange = () => {
+    const sortedChanges = [...bpmChanges].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
+    const lastChange = sortedChanges[sortedChanges.length - 1];
+    const totalBeats = getBeatAtTime(currentTime, convertBpmChangesToTime(bpmChanges));
+    const activeChange = getActiveChange(currentTime, convertBpmChangesToTime(bpmChanges));
+    const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
+    const measure = Math.floor(totalBeats / beatsPerMeasure);
+    const beat = Math.floor(totalBeats % beatsPerMeasure);
+    const newChange = {
+      measure,
+      beat,
+      bpm: lastChange ? lastChange.bpm : 120,
+      timeSignature: lastChange ? lastChange.timeSignature : '4/4',
+    };
+
+    setBpmChanges([...bpmChanges, newChange]);
+    recordOperation({
+      category: 'timing',
+      title: 'Added BPM change',
+      detail: `${formatTimingPosition(newChange.measure, newChange.beat)} | BPM ${formatHistoryNumber(newChange.bpm)} | ${newChange.timeSignature}`,
+    });
+  };
+
+  const updateSpeedChange = (index: number, updates: Partial<SpeedChange>) => {
+    const previousChange = speedChanges[index];
+    if (!previousChange) return;
+
+    const nextChange = { ...previousChange, ...updates };
+    const changedFields = Object.entries(updates).filter(([key, value]) => (
+      previousChange[key as keyof SpeedChange] !== value
+    ));
+
+    if (changedFields.length === 0) return;
+
+    setSpeedChanges(prev => prev.map((change, changeIndex) => (
+      changeIndex === index ? nextChange : change
+    )));
+
+    recordOperation({
+      category: 'speed',
+      title: 'Modified speed change',
+      detail: `${formatTimingPosition(previousChange.measure, previousChange.beat)} | ${changedFields.map(([key, value]) => `${key}: ${previousChange[key as keyof SpeedChange]} -> ${value}`).join('; ')}`,
+    });
+  };
+
+  const deleteSpeedChange = (index: number) => {
+    const deletedChange = speedChanges[index];
+    if (!deletedChange) return;
+
+    setSpeedChanges(prev => prev.filter((_, changeIndex) => changeIndex !== index));
+    recordOperation({
+      category: 'speed',
+      title: 'Deleted speed change',
+      detail: `${formatTimingPosition(deletedChange.measure, deletedChange.beat)} | ${formatHistoryNumber(deletedChange.speedChange)}x`,
+    });
+  };
+
+  const addSpeedChange = () => {
+    const totalBeats = getBeatAtTime(currentTime, convertBpmChangesToTime(bpmChanges));
+    const activeChange = getActiveChange(currentTime, convertBpmChangesToTime(bpmChanges));
+    const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
+    const newChange = {
+      measure: Math.floor(totalBeats / beatsPerMeasure),
+      beat: Math.floor(totalBeats % beatsPerMeasure),
+      speedChange: 1,
+    };
+
+    setSpeedChanges([...speedChanges, newChange]);
+    recordOperation({
+      category: 'speed',
+      title: 'Added speed change',
+      detail: `${formatTimingPosition(newChange.measure, newChange.beat)} | ${formatHistoryNumber(newChange.speedChange)}x`,
+    });
+  };
+
+  const updateOffset = (value: string | number) => {
+    const previousOffset = offset;
+    setOffset(value);
+
+    if (previousOffset !== value) {
+      recordOperation({
+        category: 'timing',
+        title: 'Modified offset',
+        detail: `${formatMaybeValue(previousOffset)} ms -> ${formatMaybeValue(value)} ms`,
+      });
+    }
+  };
+
   const jumpToNoteTime = (time: number) => {
     if (stateRef.current.isPlaying) {
       togglePlay();
@@ -1871,7 +2510,7 @@ export default function Editor({
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.3 }}
-      className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col font-sans"
+      className="h-screen overflow-hidden bg-neutral-950 text-neutral-50 flex flex-col font-sans"
     >
       {projectData?.audioUrl && (
         <audio 
@@ -2209,17 +2848,55 @@ export default function Editor({
           >
             <Settings className="w-4 h-4" />
           </button>
-          <button 
-            onClick={saveLevel}
-            className="p-2 hover:bg-neutral-800 rounded-lg transition-colors text-neutral-400 hover:text-white"
-            title="Save Level"
-          >
-            <Save className="w-4 h-4" />
-          </button>
-          <button className="flex items-center gap-2 px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg transition-colors text-sm font-medium ml-2">
-            <Save className="w-4 h-4" />
-            Save
-          </button>
+          <div className="relative ml-2">
+            <button
+              type="button"
+              onClick={() => setIsExportMenuOpen(current => !current)}
+              className="flex items-center gap-2 px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg transition-colors text-sm font-medium"
+              title="Export Level"
+              aria-haspopup="menu"
+              aria-expanded={isExportMenuOpen}
+            >
+              <Download className="w-4 h-4" />
+              Export
+            </button>
+            {isExportMenuOpen && (
+              <div
+                className="absolute right-0 top-full z-50 mt-2 w-64 rounded-lg border border-neutral-700 bg-neutral-950 p-2 shadow-2xl shadow-black/40"
+                role="menu"
+              >
+                {hasExportIncompatibleTimeSignature && (
+                  <p className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200">
+                    Export is incompatible with DR3Viewer and DR3FP formats due to unique time signatures.
+                  </p>
+                )}
+                <button
+                  type="button"
+                  disabled={hasExportIncompatibleTimeSignature || !projectData?.songFile}
+                  onClick={() => {
+                    setIsExportMenuOpen(false);
+                    void exportDr3Viewer();
+                  }}
+                  className="w-full rounded px-3 py-2 text-left text-sm text-neutral-200 transition-colors hover:bg-neutral-800 disabled:cursor-not-allowed disabled:text-neutral-500 disabled:hover:bg-transparent"
+                  role="menuitem"
+                >
+                  DR3Viewer format
+                </button>
+                <button
+                  type="button"
+                  disabled={hasExportIncompatibleTimeSignature || !projectData?.songFile}
+                  onClick={() => {
+                    setIsExportMenuOpen(false);
+                    void exportDr3Fp();
+                  }}
+                  className="w-full rounded px-3 py-2 text-left text-sm text-neutral-200 transition-colors hover:bg-neutral-800 disabled:cursor-not-allowed disabled:text-neutral-500 disabled:hover:bg-transparent"
+                  role="menuitem"
+                >
+                  DR3FP format
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -2242,16 +2919,16 @@ export default function Editor({
       <main className="flex-1 flex overflow-hidden min-h-0">
         {/* Left Sidebar - General Functions */}
         <aside className={`${isLeftPanelCompact ? 'w-12' : 'w-64'} shrink-0 border-r border-neutral-800 bg-neutral-900/30 flex flex-col transition-all duration-300 overflow-hidden`}>
-          <div className={`p-2 border-b border-neutral-800 flex ${isLeftPanelCompact ? 'justify-center' : 'justify-start'}`}>
+          <div className={`p-2 border-b border-neutral-800 flex ${isLeftPanelContentVisible ? 'justify-start' : 'justify-center'}`}>
             <button
-              onClick={() => setIsLeftPanelCompact(!isLeftPanelCompact)}
-              className={`flex items-center gap-2 rounded text-neutral-400 hover:bg-neutral-800 hover:text-white transition-colors ${isLeftPanelCompact ? 'p-1' : 'px-2 py-1 text-xs font-medium'}`}
+              onClick={toggleLeftPanelCompact}
+              className={`flex items-center gap-2 rounded text-neutral-400 hover:bg-neutral-800 hover:text-white transition-colors ${isLeftPanelContentVisible ? 'px-2 py-1 text-xs font-medium' : 'p-1'}`}
             >
               {isLeftPanelCompact ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
-              {!isLeftPanelCompact && <span>Collapse Window</span>}
+              {isLeftPanelContentVisible && <span>Collapse Window</span>}
             </button>
           </div>
-          {!isLeftPanelCompact && activeLeftPanel === 'main' && (
+          {isLeftPanelContentVisible && activeLeftPanel === 'main' && (
             <div className="p-4 flex flex-col gap-4 h-full overflow-y-auto min-h-0">
               <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">General Functions</div>
               <div className="flex flex-col gap-2 flex-1">
@@ -2334,7 +3011,7 @@ export default function Editor({
             </div>
           )}
 
-          {activeLeftPanel === 'editInfo' && (
+          {isLeftPanelContentVisible && activeLeftPanel === 'editInfo' && (
             <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
@@ -2388,7 +3065,7 @@ export default function Editor({
             </div>
           )}
 
-          {activeLeftPanel === 'bpmTiming' && (
+          {isLeftPanelContentVisible && activeLeftPanel === 'bpmTiming' && (
             <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
@@ -2396,91 +3073,67 @@ export default function Editor({
                 </button>
                 <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">BPM / Timing</div>
               </div>
-              <div className="flex flex-col gap-4 overflow-y-auto flex-1 pr-1 pb-4 min-h-0">
-                <div>
+              <div className="flex flex-col gap-4 overflow-hidden flex-1 pr-1 pb-4 min-h-0">
+                <div className="shrink-0">
                   <label className="block text-xs text-neutral-400 mb-1">Offset (ms)</label>
-                  <input type="number" value={offset} className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => {
-                    const val = e.target.value;
-                    if (val === '-' || val === "") setOffset(val);
+                  <CommitInput type="number" value={offset} className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onCommit={(val) => {
+                    if (val === '-' || val === "") updateOffset(val);
                     else {
                       const num = parseFloat(val);
-                      setOffset(isNaN(num) ? 0 : num);
+                      updateOffset(isNaN(num) ? 0 : num);
                     }
                   }} />
                 </div>
-                <div>
-                  <label className="block text-xs text-neutral-400 mb-1">BPM Changes</label>
-                  <table className="w-full text-sm text-neutral-300">
-                    <thead>
-                      <tr className="text-left text-neutral-500">
-                        <th className="pb-2">Meas</th>
-                        <th className="pb-2">Beat</th>
-                        <th className="pb-2">BPM</th>
-                        <th className="pb-2">Sig</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {bpmChanges.map((change, index) => (
-                        <tr key={index}>
-                          <td className="py-1"><input type="number" value={change.measure} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
-                            const newChanges = [...bpmChanges];
-                            newChanges[index].measure = parseInt(e.target.value) || 0;
-                            setBpmChanges(newChanges);
-                          }} /></td>
-                          <td className="py-1"><input type="number" value={change.beat} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
-                            const newChanges = [...bpmChanges];
-                            newChanges[index].beat = parseInt(e.target.value) || 0;
-                            setBpmChanges(newChanges);
-                          }} /></td>
-                          <td className="py-1"><input type="number" value={change.bpm} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
-                            const newChanges = [...bpmChanges];
-                            newChanges[index].bpm = parseFloat(e.target.value) || 120;
-                            setBpmChanges(newChanges);
-                          }} /></td>
-                          <td className="py-1"><input type="text" value={change.timeSignature} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
-                            const newChanges = [...bpmChanges];
-                            newChanges[index].timeSignature = e.target.value;
-                            setBpmChanges(newChanges);
-                          }} /></td>
-                          <td className="py-1">
-                            {index > 0 && (
-                              <button onClick={() => {
-                                const newChanges = bpmChanges.filter((_, i) => i !== index);
-                                setBpmChanges(newChanges);
-                              }} className="text-red-400 hover:text-red-300">
-                                <X className="w-4 h-4" />
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  <button onClick={() => {
-                    const sortedChanges = [...bpmChanges].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
-                    const lastChange = sortedChanges[sortedChanges.length - 1];
-                    
-                    // Need to calculate current measure and beat
-                    const totalBeats = getBeatAtTime(currentTime, convertBpmChangesToTime(bpmChanges));
-                    const activeChange = getActiveChange(currentTime, convertBpmChangesToTime(bpmChanges));
-                    const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
-                    
-                    const measure = Math.floor(totalBeats / beatsPerMeasure);
-                    const beat = Math.floor(totalBeats % beatsPerMeasure);
-
-                    setBpmChanges([...bpmChanges, {
-                      measure: measure,
-                      beat: beat,
-                      bpm: lastChange ? lastChange.bpm : 120, 
-                      timeSignature: lastChange ? lastChange.timeSignature : '4/4'
-                    }]);
-                  }} className="w-full p-2 bg-neutral-800 hover:bg-neutral-700 text-white rounded text-sm mt-2 transition-colors">Add BPM Change</button>
+                <div className="flex flex-1 min-h-0 flex-col">
+                  <p className="mb-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200">
+                    Export currently only supports BPM changes with 4/4 time signatures.
+                  </p>
+                  <label className="block shrink-0 text-xs text-neutral-400 mb-1">BPM Changes</label>
+                  <div className="grid grid-cols-[2.5rem_2.5rem_3rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
+                    <div>Meas</div>
+                    <div>Beat</div>
+                    <div>BPM</div>
+                    <div>Sig</div>
+                    <div />
+                  </div>
+                  <VirtualizedChangeList
+                    items={bpmChanges}
+                    rowHeight={36}
+                    getKey={(_, index) => index}
+                    className="min-h-0 flex-1 pr-1 text-sm text-neutral-300"
+                    renderRow={(change, index, style) => (
+                      <div style={style} className="grid grid-cols-[2.5rem_2.5rem_3rem_3rem_1.5rem] items-center gap-1">
+                        <CommitInput type="number" value={change.measure} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                            updateBpmChange(index, { measure: parseInt(value) || 0 });
+                          }} />
+                        <CommitInput type="number" value={change.beat} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                            updateBpmChange(index, { beat: parseInt(value) || 0 });
+                          }} />
+                        <CommitInput type="number" value={change.bpm} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                            updateBpmChange(index, { bpm: parseFloat(value) || 120 });
+                          }} />
+                        <CommitInput type="text" value={change.timeSignature} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                            updateBpmChange(index, { timeSignature: value });
+                          }} />
+                        <div>
+                          {index > 0 && (
+                            <button onClick={() => {
+                              deleteBpmChange(index);
+                            }} className="text-red-400 hover:text-red-300">
+                              <X className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  />
+                  <button onClick={addBpmChange} className="w-full shrink-0 p-2 bg-neutral-800 hover:bg-neutral-700 text-white rounded text-sm mt-2 transition-colors">Add BPM Change</button>
                 </div>
               </div>
             </div>
           )}
 
-          {activeLeftPanel === 'speedChanges' && (
+          {isLeftPanelContentVisible && activeLeftPanel === 'speedChanges' && (
             <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
@@ -2488,68 +3141,49 @@ export default function Editor({
                 </button>
                 <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Speed Changes</div>
               </div>
-              <div className="flex flex-col gap-4 overflow-y-auto flex-1 pr-1 pb-4 min-h-0">
-                <table className="w-full text-sm text-neutral-300">
-                  <thead>
-                    <tr className="text-left text-neutral-500">
-                      <th className="pb-2">Meas</th>
-                      <th className="pb-2">Beat</th>
-                      <th className="pb-2">Speed</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {speedChanges.map((change, index) => (
-                      <tr key={index}>
-                        <td className="py-1"><input type="number" value={change.measure} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
-                          const newChanges = [...speedChanges];
-                          newChanges[index].measure = parseInt(e.target.value) || 0;
-                          setSpeedChanges(newChanges);
-                        }} /></td>
-                        <td className="py-1"><input type="number" value={change.beat} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
-                          const newChanges = [...speedChanges];
-                          newChanges[index].beat = parseInt(e.target.value) || 0;
-                          setSpeedChanges(newChanges);
-                        }} /></td>
-                        <td className="py-1"><input type="number" step="0.1" value={change.speedChange} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onChange={(e) => {
-                          const newChanges = [...speedChanges];
-                          const val = parseFloat(e.target.value);
-                          newChanges[index].speedChange = isNaN(val) ? 1 : val;
-                          setSpeedChanges(newChanges);
-                        }} /></td>
-                        <td className="py-1">
-                          {index > 0 && (
-                            <button onClick={() => {
-                              const newChanges = speedChanges.filter((_, i) => i !== index);
-                              setSpeedChanges(newChanges);
-                            }} className="text-red-400 hover:text-red-300">
-                              <X className="w-4 h-4" />
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <button onClick={() => {
-                  const totalBeats = getBeatAtTime(currentTime, convertBpmChangesToTime(bpmChanges));
-                  const activeChange = getActiveChange(currentTime, convertBpmChangesToTime(bpmChanges));
-                  const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
-                  
-                  const measure = Math.floor(totalBeats / beatsPerMeasure);
-                  const beat = Math.floor(totalBeats % beatsPerMeasure);
-
-                  setSpeedChanges([...speedChanges, {
-                    measure: measure,
-                    beat: beat,
-                    speedChange: 1
-                  }]);
-                }} className="w-full p-2 bg-neutral-800 hover:bg-neutral-700 text-white rounded text-sm mt-2 transition-colors">Add Speed Change</button>
+              <div className="flex flex-col overflow-hidden flex-1 pr-1 pb-4 min-h-0">
+                <div className="grid grid-cols-[2.5rem_2.5rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
+                  <div>Meas</div>
+                  <div>Beat</div>
+                  <div>Speed</div>
+                  <div />
+                </div>
+                <VirtualizedChangeList
+                  items={speedChanges}
+                  rowHeight={36}
+                  getKey={(_, index) => index}
+                  className="min-h-0 flex-1 pr-1 text-sm text-neutral-300"
+                  renderRow={(change, index, style) => (
+                    <div style={style} className="grid grid-cols-[2.5rem_2.5rem_3rem_1.5rem] items-center gap-1">
+                      <CommitInput type="number" value={change.measure} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                          updateSpeedChange(index, { measure: parseInt(value) || 0 });
+                        }} />
+                      <CommitInput type="number" value={change.beat} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                          updateSpeedChange(index, { beat: parseInt(value) || 0 });
+                        }} />
+                      <CommitInput type="number" step="0.1" value={change.speedChange} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                          const val = parseFloat(value);
+                          updateSpeedChange(index, { speedChange: isNaN(val) ? 1 : val });
+                        }} />
+                      <div>
+                        {index > 0 && (
+                          <button onClick={() => {
+                            deleteSpeedChange(index);
+                          }} className="text-red-400 hover:text-red-300">
+                            <X className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                />
+                <button onClick={addSpeedChange} className="w-full shrink-0 p-2 bg-neutral-800 hover:bg-neutral-700 text-white rounded text-sm mt-2 transition-colors">Add Speed Change</button>
               </div>
             </div>
           )}
 
-          {['curveSC', 'history'].includes(activeLeftPanel) && (
-            <div className="p-4 flex flex-col h-full">
+          {isLeftPanelContentVisible && ['curveSC', 'history'].includes(activeLeftPanel) && (
+            <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
                   <ArrowLeft className="w-4 h-4" />
@@ -2558,9 +3192,44 @@ export default function Editor({
                   {activeLeftPanel === 'curveSC' ? 'Curve SC' : 'History'}
                 </div>
               </div>
-              <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
-                Not implemented yet
-              </div>
+              {activeLeftPanel === 'curveSC' ? (
+                <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
+                  Not implemented yet
+                </div>
+              ) : operationHistory.length === 0 ? (
+                <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
+                  No operations recorded yet
+                </div>
+              ) : (
+                <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+                  <ol className="flex flex-col gap-2">
+                    {operationHistory.map(entry => (
+                      <li
+                        key={entry.id}
+                        className="rounded-lg border border-neutral-800 bg-neutral-950/40 p-3"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0 text-sm font-medium text-neutral-200">
+                            {entry.title}
+                          </div>
+                          <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase ${operationCategoryStyles[entry.category]}`}>
+                            {entry.category}
+                          </span>
+                        </div>
+                        <div className="mt-1 break-words text-xs leading-5 text-neutral-400">
+                          {entry.detail}
+                        </div>
+                        <div className="mt-2 flex items-center justify-between text-[11px] text-neutral-600">
+                          <span>#{entry.id}</span>
+                          <time dateTime={new Date(entry.timestamp).toISOString()}>
+                            {formatHistoryTimestamp(entry.timestamp)}
+                          </time>
+                        </div>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
             </div>
           )}
         </aside>
@@ -2576,7 +3245,7 @@ export default function Editor({
               <div className="w-16 h-16 border-2 border-dashed border-neutral-700 rounded-full flex items-center justify-center">
                 <span className="text-2xl">🎵</span>
               </div>
-              <p>Fill in project details in Chart Metadata to start editing.</p>
+              <p>{emptyCanvasMessage}</p>
             </div>
           ) : (
             <EditorCanvas 
@@ -2607,20 +3276,29 @@ export default function Editor({
 
         {/* Right Sidebar - Properties */}
         <aside className={`${isRightPanelCompact ? 'w-12' : 'w-64'} shrink-0 border-l border-neutral-800 bg-neutral-900/30 flex flex-col transition-all duration-300 overflow-hidden`}>
-          <div className={`p-2 border-b border-neutral-800 flex ${isRightPanelCompact ? 'justify-center' : 'justify-start'}`}>
+          <div className={`p-2 border-b border-neutral-800 flex ${isRightPanelContentVisible ? 'justify-start' : 'justify-center'}`}>
             <button
-              onClick={() => setIsRightPanelCompact(!isRightPanelCompact)}
-              className={`flex items-center gap-2 rounded text-neutral-400 hover:bg-neutral-800 hover:text-white transition-colors ${isRightPanelCompact ? 'p-1' : 'px-2 py-1 text-xs font-medium'}`}
+              onClick={toggleRightPanelCompact}
+              className={`flex items-center gap-2 rounded text-neutral-400 hover:bg-neutral-800 hover:text-white transition-colors ${isRightPanelContentVisible ? 'px-2 py-1 text-xs font-medium' : 'p-1'}`}
             >
               {isRightPanelCompact ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-              {!isRightPanelCompact && <span>Collapse Window</span>}
+              {isRightPanelContentVisible && <span>Collapse Window</span>}
             </button>
           </div>
-          {!isRightPanelCompact && (
+          {isRightPanelContentVisible && (
             <div className="p-4 flex flex-col gap-4 overflow-y-auto">
               <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Properties</div>
               {selectedSingleNote ? (
                 <div className="flex flex-col gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedNoteIds([])}
+                    className="flex w-full items-center justify-center gap-2 rounded border border-neutral-700 bg-neutral-800 px-3 py-2 text-xs font-medium text-neutral-300 transition-colors hover:bg-neutral-700 hover:text-white"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                    <span>Deselect All</span>
+                  </button>
+
                   <div className="rounded-lg border border-neutral-800 bg-neutral-950/40 p-3">
                     <div className="flex items-center gap-3">
                       <div
@@ -2653,27 +3331,27 @@ export default function Editor({
 
                   <label className="block">
                     <span className="mb-1 block text-xs text-neutral-400">Timepos (measure/decimal)</span>
-                    <input
+                    <CommitInput
                       type="number"
                       step="0.001"
                       min="0"
                       value={Number(selectedNoteTimepos.toFixed(3))}
                       className={notePropertyInputClass}
-                      onChange={(e) => updateSelectedNote({ time: getTimeFromTimepos(Math.max(0, Number(e.target.value) || 0)) })}
+                      onCommit={(value) => updateSelectedNote({ time: getTimeFromTimepos(Math.max(0, Number(value) || 0)) })}
                     />
                   </label>
 
                   <label className="block">
                     <span className="mb-1 block text-xs text-neutral-400">Lane</span>
-                    <input
+                    <CommitInput
                       type="number"
                       min="1"
                       max="8"
                       step="0.01"
                       value={selectedSingleNote.lane + 1}
                       className={notePropertyInputClass}
-                      onChange={(e) => {
-                        const lane = Math.max(1, Math.min(8, Number(e.target.value) || 1)) - 1;
+                      onCommit={(value) => {
+                        const lane = Math.max(1, Math.min(8, Number(value) || 1)) - 1;
                         updateSelectedNote({ lane });
                       }}
                     />
@@ -2681,15 +3359,15 @@ export default function Editor({
 
                   <label className="block">
                     <span className="mb-1 block text-xs text-neutral-400">Width</span>
-                    <input
+                    <CommitInput
                       type="number"
                       min="1"
                       max="16"
                       step="0.01"
                       value={selectedSingleNote.width}
                       className={notePropertyInputClass}
-                      onChange={(e) => {
-                        const width = Math.max(1, Math.min(16, Number(e.target.value) || 1));
+                      onCommit={(value) => {
+                        const width = Math.max(1, Math.min(16, Number(value) || 1));
                         updateSelectedNote({ width });
                       }}
                     />
@@ -2698,16 +3376,16 @@ export default function Editor({
                   <label className="block">
                     <span className="mb-1 block text-xs text-neutral-400">Parent ID</span>
                     <div className="flex gap-2">
-                      <input
+                      <CommitInput
                         type="number"
                         min="0"
                         value={selectedSingleNote.parentId ?? ''}
                         placeholder="None"
                         className={notePropertyInputClass}
                         disabled={!canEditSelectedNoteParent}
-                        onChange={(e) => {
-                          const value = e.target.value.trim();
-                          updateSelectedNote({ parentId: value === '' ? null : Math.max(0, Number(value) || 0) });
+                        onCommit={(value) => {
+                          const trimmedValue = value.trim();
+                          updateSelectedNote({ parentId: trimmedValue === '' ? null : Math.max(0, Number(trimmedValue) || 0) });
                         }}
                       />
                       <button
@@ -2727,24 +3405,55 @@ export default function Editor({
 
                   <label className="block">
                     <span className="mb-1 block text-xs text-neutral-400">Speed</span>
-                    <input
+                    <CommitInput
                       type="text"
                       value={selectedSingleNote.speed ?? ''}
                       placeholder="Default"
                       className={notePropertyInputClass}
-                      onChange={(e) => {
-                        const value = e.target.value.replace(/\s+/g, '');
-                        updateSelectedNote({ speed: value === '' ? undefined : value });
+                      onCommit={(value) => {
+                        const normalizedValue = value.replace(/\s+/g, '');
+                        updateSelectedNote({ speed: normalizedValue === '' ? undefined : normalizedValue });
                       }}
                     />
                   </label>
                 </div>
               ) : (
-                <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
-                  {selectedNoteIds.length > 1
-                    ? `${selectedNoteIds.length} notes selected`
-                    : 'Shift-click a note to edit its properties'}
-                </div>
+                selectedNoteIds.length > 1 ? (
+                  <div className="flex flex-col gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedNoteIds([])}
+                      className="flex w-full items-center justify-center gap-2 rounded border border-neutral-700 bg-neutral-800 px-3 py-2 text-xs font-medium text-neutral-300 transition-colors hover:bg-neutral-700 hover:text-white"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      <span>Deselect All</span>
+                    </button>
+                    <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
+                      {`${selectedNoteIds.length} notes selected`}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-neutral-800 bg-neutral-950/40 p-3">
+                    <div className="text-sm font-medium text-neutral-200">Chart Summary</div>
+                    <div className="mt-3 flex flex-col divide-y divide-neutral-800 text-sm">
+                      <div className="flex items-center justify-between py-2 first:pt-0">
+                        <span className="text-neutral-400">Notes</span>
+                        <span className="font-mono text-neutral-100">{notes.length}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-2">
+                        <span className="text-neutral-400">BPM Changes</span>
+                        <span className="font-mono text-neutral-100">{bpmChanges.length}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-2 last:pb-0">
+                        <span className="text-neutral-400">Speed Changes</span>
+                        <span className="font-mono text-neutral-100">{speedChanges.length}</span>
+                      </div>
+                    </div>
+                    <p className="mt-3 border-t border-neutral-800 pt-3 text-xs leading-5 text-neutral-500">
+                      Control + left-click a note to edit its properties.
+                    </p>
+                  </div>
+                )
               )}
             </div>
           )}
