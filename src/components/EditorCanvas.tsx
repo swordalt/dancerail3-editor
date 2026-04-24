@@ -1,4 +1,4 @@
-import React, { useEffect, useCallback } from 'react';
+import React, { useEffect, useCallback, useMemo } from 'react';
 import { NOTE_TYPES, HOLD_CONNECTOR_TYPES, HOLD_CENTER_TYPES, HOLD_END_TYPES, HOLD_START_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from '../constants/editorConstants';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from '../utils/editorUtils';
 import type { BpmChange, Note, ProjectData, SelectionBox, SpeedChange } from '../types/editorTypes';
@@ -17,8 +17,12 @@ interface EditorCanvasProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   containerRef: React.RefObject<HTMLDivElement | null>;
   projectData: ProjectData | null;
+  bpmChanges: BpmChange[];
+  speedChanges: SpeedChange[];
   gridZoom: number;
   pixelsPerBeat: number;
+  currentTime: number;
+  offset: string | number;
   stateRef: React.MutableRefObject<EditorCanvasState>;
   selectedNoteIds: number[];
   selectionBox: SelectionBox | null;
@@ -34,9 +38,15 @@ interface EditorCanvasProps {
 }
 
 export default function EditorCanvas({ 
-  canvasRef, containerRef, projectData, gridZoom, pixelsPerBeat, stateRef, selectedNoteIds, selectionBox, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef,
+  canvasRef, containerRef, projectData, bpmChanges, speedChanges, gridZoom, pixelsPerBeat, currentTime, offset, stateRef, selectedNoteIds, selectionBox, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef,
   onMouseDown, onMouseMove, onMouseUp, onMouseLeave, onContextMenu
 }: EditorCanvasProps) {
+  const sortedChanges = useMemo(
+    () => convertBpmChangesToTime(bpmChanges),
+    [bpmChanges],
+  );
+  const selectedNoteIdSet = useMemo(() => new Set(selectedNoteIds), [selectedNoteIds]);
+
   const drawArrow = (
     ctx: CanvasRenderingContext2D,
     centerX: number,
@@ -121,6 +131,44 @@ export default function EditorCanvas({
 
     return segments.join(',');
   };
+
+  const noteRenderIndex = useMemo(() => {
+    const notesById = new Map<number, Note>();
+    const noteBeats = new Map<number, number>();
+    const groupedNoteIds = new Map<string, number[]>();
+
+    stateRef.current.notes.forEach((note) => {
+      notesById.set(note.id, note);
+      noteBeats.set(note.id, getBeatAtTime(note.time, sortedChanges));
+
+      const key = `${note.time.toFixed(6)}:${note.lane}`;
+      const groupedIds = groupedNoteIds.get(key);
+      if (groupedIds) {
+        groupedIds.push(note.id);
+      } else {
+        groupedNoteIds.set(key, [note.id]);
+      }
+    });
+
+    const groupedIdLabels = new Map<string, string>();
+    groupedNoteIds.forEach((groupedIds, key) => {
+      groupedIdLabels.set(key, formatGroupedIds(groupedIds));
+    });
+
+    const selectedParentNoteIds = new Set<number>();
+    stateRef.current.notes.forEach((note) => {
+      if (selectedNoteIdSet.has(note.id) && note.parentId !== null) {
+        selectedParentNoteIds.add(note.parentId);
+      }
+    });
+
+    return {
+      notesById,
+      noteBeats,
+      groupedIdLabels,
+      selectedParentNoteIds,
+    };
+  }, [selectedNoteIdSet, sortedChanges, stateRef.current.notes]);
   
   const drawGrid = useCallback(() => {
     const canvas = canvasRef.current;
@@ -128,27 +176,36 @@ export default function EditorCanvas({
     if (!canvas || !container) return;
 
     const rect = container.getBoundingClientRect();
-    if (canvas.width !== rect.width || canvas.height !== rect.height) {
-      canvas.width = rect.width;
-      canvas.height = rect.height;
+    const displayWidth = Math.max(1, Math.floor(rect.width));
+    const displayHeight = Math.max(1, Math.floor(rect.height));
+    const dpr = window.devicePixelRatio || 1;
+    const pixelWidth = Math.floor(displayWidth * dpr);
+    const pixelHeight = Math.floor(displayHeight * dpr);
+
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+      canvas.style.width = `${displayWidth}px`;
+      canvas.style.height = `${displayHeight}px`;
     }
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const { width, height } = canvas;
+    const width = displayWidth;
+    const height = displayHeight;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
     if (!projectData) return;
-
-    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
 
     const activeChange = getActiveChange(stateRef.current.currentTime, sortedChanges);
     const bpm = activeChange.bpm;
     let time = stateRef.current.currentTime;
     
     if (stateRef.current.isPlaying && audioRef.current) {
-      time = audioRef.current.currentTime;
+      const offsetInSeconds = parseFloat(offset.toString()) / 1000;
+      time = audioRef.current.currentTime + offsetInSeconds;
       stateRef.current.currentTime = time;
     }
 
@@ -243,28 +300,53 @@ export default function EditorCanvas({
       }
     }
 
-    // Draw BPM/Time Signature change indicators
+    const indicatorX = startX + gridWidth + 10;
+    const indicatorOffset = 6;
+    const bpmIndicatorKeys = new Set<string>();
+
+    // Draw BPM/Time Signature change indicators on the right side.
     sortedChanges.forEach(change => {
       const changeBeat = getBeatAtTime(change.time, sortedChanges);
       const y = hitLineY - (changeBeat - currentBeat) * pixelsPerBeat;
-      
+
       // Only draw indicators that are not at time 0 (as they are implied)
       if (change.time > 0 && y > 0 && y < height) {
+        const indicatorKey = `${change.measure}:${change.beat}`;
+        bpmIndicatorKeys.add(indicatorKey);
+        const sharesTimeWithSpeed = speedChanges.some(sc => `${sc.measure}:${sc.beat}` === indicatorKey);
         ctx.fillStyle = '#f59e0b';
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`BPM: ${change.bpm} | ${change.timeSignature}`, startX + gridWidth + 10, y);
+        ctx.fillText(`BPM: ${change.bpm} | ${change.timeSignature}`, indicatorX, y + (sharesTimeWithSpeed ? indicatorOffset : 0));
+      }
+    });
+
+    // Draw speed change indicators on the right side, above BPM changes at the same time position.
+    speedChanges.forEach(sc => {
+      const scBeat = sc.measure * 4 + sc.beat;
+      const y = hitLineY - (scBeat - currentBeat) * pixelsPerBeat;
+
+      if (y > 0 && y < height) {
+        const sharesTimeWithBpm = bpmIndicatorKeys.has(`${sc.measure}:${sc.beat}`);
+        ctx.fillStyle = '#06b6d4';
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`SC: ${sc.speedChange.toFixed(1)}x`, indicatorX, y - (sharesTimeWithBpm ? indicatorOffset : 0));
       }
     });
 
     // Draw hold connections
     stateRef.current.notes.forEach((note) => {
       if (HOLD_CONNECTOR_TYPES.includes(note.type) && !HOLD_START_TYPES.includes(note.type) && note.parentId !== null) {
-        const parentNote = stateRef.current.notes.find((n) => n.id === note.parentId);
+        const parentNote = noteRenderIndex.notesById.get(note.parentId);
         if (parentNote) {
-          const noteBeat = getBeatAtTime(note.time, sortedChanges);
-          const parentBeat = getBeatAtTime(parentNote.time, sortedChanges);
+          const noteBeat = noteRenderIndex.noteBeats.get(note.id);
+          const parentBeat = noteRenderIndex.noteBeats.get(parentNote.id);
+          if (noteBeat === undefined || parentBeat === undefined) {
+            return;
+          }
           
           const y1 = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
           const y2 = hitLineY - (parentBeat - currentBeat) * pixelsPerBeat;
@@ -290,25 +372,13 @@ export default function EditorCanvas({
       }
     });
 
-    const notesAtPosition = new Map<string, number[]>();
-    stateRef.current.notes.forEach((note) => {
-      const key = `${note.time.toFixed(6)}:${note.lane}`;
-      const groupedIds = notesAtPosition.get(key);
-      if (groupedIds) {
-        groupedIds.push(note.id);
-      } else {
-        notesAtPosition.set(key, [note.id]);
-      }
-    });
-    const selectedParentNoteIds = new Set(
-      stateRef.current.notes
-        .filter((note) => selectedNoteIds.includes(note.id) && note.parentId !== null)
-        .map((note) => note.parentId as number),
-    );
-
     // Draw notes
     stateRef.current.notes.forEach((note) => {
-      const noteBeat = getBeatAtTime(note.time, sortedChanges);
+      const noteBeat = noteRenderIndex.noteBeats.get(note.id);
+      if (noteBeat === undefined) {
+        return;
+      }
+
       const y = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       
       if (y > -50 && y < height + 50) {
@@ -385,12 +455,12 @@ export default function EditorCanvas({
         }
 
         // Highlight if selected
-        if (selectedNoteIds.includes(note.id)) {
+        if (selectedNoteIdSet.has(note.id)) {
           ctx.setLineDash([]);
           ctx.strokeStyle = '#ff00ff';
           ctx.lineWidth = 4;
           ctx.strokeRect(x, y - 12, notePixelWidth, 24);
-        } else if (selectedParentNoteIds.has(note.id)) {
+        } else if (noteRenderIndex.selectedParentNoteIds.has(note.id)) {
           ctx.setLineDash([6, 4]);
           ctx.strokeStyle = '#ff00ff';
           ctx.lineWidth = 3;
@@ -403,8 +473,8 @@ export default function EditorCanvas({
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        const groupedIds = notesAtPosition.get(`${note.time.toFixed(6)}:${note.lane}`) || [note.id];
-        ctx.fillText(formatGroupedIds(groupedIds), x + notePixelWidth / 2, y + 12);
+        const groupedIdsLabel = noteRenderIndex.groupedIdLabels.get(`${note.time.toFixed(6)}:${note.lane}`) ?? `${note.id}`;
+        ctx.fillText(groupedIdsLabel, x + notePixelWidth / 2, y + 12);
       }
     });
 
@@ -435,7 +505,7 @@ export default function EditorCanvas({
     ctx.stroke();
     ctx.shadowBlur = 0;
 
-  }, [pixelsPerBeat, projectData, gridZoom, selectedNoteIds, selectionBox, canvasRef, containerRef, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef]);
+  }, [pixelsPerBeat, projectData, gridZoom, currentTime, selectionBox, canvasRef, containerRef, offset, speedChanges, stateRef, timeDisplayRef, progressBarRef, isDraggingProgress, audioRef, noteRenderIndex, selectedNoteIdSet, sortedChanges]);
 
   useEffect(() => {
     drawGrid();

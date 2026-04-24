@@ -24,6 +24,7 @@ export interface BpmChange {
 
 export interface TimedBpmChange {
   time: number;
+  startBeat: number;
   bpm: number;
   timeSignature: string;
 }

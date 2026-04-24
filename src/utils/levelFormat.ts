@@ -20,7 +20,7 @@ export function parseLevelText(text: string): ParsedLevelData {
     const normalizedLine = line.trim();
 
     if (normalizedLine.startsWith('#OFFSET=')) {
-      offset = parseFloat(normalizedLine.split('=')[1]) * 1000;
+      offset = parseFloat(normalizedLine.split('=')[1]) * -1000;
       continue;
     }
 
@@ -113,7 +113,7 @@ export function buildLevelText(params: {
     return Number.isFinite(numericSpeed) ? formatNoteValue(numericSpeed) : normalizedSpeed;
   };
 
-  let content = `#OFFSET=${parseFloat(offset.toString()) / 1000};\n`;
+  let content = `#OFFSET=${parseFloat(offset.toString()) / -1000};\n`;
   content += '#BEAT=1;\n';
   content += '#BPM_NUMBER=1;\n';
   content += `#BPM [0]=${projectData.bpm || 120};\n`;

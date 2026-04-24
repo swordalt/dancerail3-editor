@@ -1,22 +1,79 @@
 import type { BpmChange, TimedBpmChange } from '../types/editorTypes';
 
+const DEFAULT_BPM = 120;
+const DEFAULT_TIME_SIGNATURE = '4/4';
+
+const getBeatsPerMeasure = (timeSignature: string) => parseInt(timeSignature.split('/')[0], 10) || 4;
+
+const findLastChangeIndexByTime = (time: number, changes: TimedBpmChange[]) => {
+  let low = 0;
+  let high = changes.length - 1;
+  let result = 0;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (changes[mid].time <= time) {
+      result = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return result;
+};
+
+const findLastChangeIndexByBeat = (beat: number, changes: TimedBpmChange[]) => {
+  let low = 0;
+  let high = changes.length - 1;
+  let result = 0;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (changes[mid].startBeat <= beat) {
+      result = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return result;
+};
+
 export const convertBpmChangesToTime = (changes: BpmChange[]): TimedBpmChange[] => {
   const sortedChanges = [...changes].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
   const timeChanges: TimedBpmChange[] = [];
   
   let currentTime = 0;
+  let currentBeat = 0;
   let lastMeasure = 0;
   let lastBeat = 0;
-  let lastBpm = 120;
-  let lastTimeSignature = '4/4';
+  let lastBpm = DEFAULT_BPM;
+  let lastTimeSignature = DEFAULT_TIME_SIGNATURE;
+
+  if (sortedChanges.length === 0 || sortedChanges[0].measure !== 0 || sortedChanges[0].beat !== 0) {
+    timeChanges.push({
+      time: 0,
+      startBeat: 0,
+      bpm: DEFAULT_BPM,
+      timeSignature: DEFAULT_TIME_SIGNATURE,
+    });
+  }
   
   for (const change of sortedChanges) {
-    const beatsPerMeasure = parseInt(lastTimeSignature.split('/')[0]) || 4;
+    const beatsPerMeasure = getBeatsPerMeasure(lastTimeSignature);
     const beatsToNextChange = (change.measure - lastMeasure) * beatsPerMeasure + (change.beat - lastBeat);
     
     currentTime += beatsToNextChange * (60 / lastBpm);
+    currentBeat += beatsToNextChange;
     
-    timeChanges.push({time: currentTime, bpm: change.bpm, timeSignature: change.timeSignature});
+    timeChanges.push({
+      time: currentTime,
+      startBeat: currentBeat,
+      bpm: change.bpm,
+      timeSignature: change.timeSignature,
+    });
     
     lastMeasure = change.measure;
     lastBeat = change.beat;
@@ -28,63 +85,38 @@ export const convertBpmChangesToTime = (changes: BpmChange[]): TimedBpmChange[] 
 };
 
 export const getActiveChange = (time: number, changes: TimedBpmChange[]) => {
-  const sortedChanges = [...changes].sort((a, b) => a.time - b.time);
-  let activeChange = sortedChanges[0];
-  for (const change of sortedChanges) {
-    if (time >= change.time) {
-      activeChange = change;
-    } else {
-      break;
-    }
+  if (changes.length === 0) {
+    return {
+      time: 0,
+      startBeat: 0,
+      bpm: DEFAULT_BPM,
+      timeSignature: DEFAULT_TIME_SIGNATURE,
+    };
   }
-  return activeChange;
+
+  return changes[findLastChangeIndexByTime(time, changes)];
 };
 
 export const getBeatAtTime = (time: number, changes: TimedBpmChange[]) => {
-  const sortedChanges = [...changes].sort((a, b) => a.time - b.time);
-  let accumulatedBeats = 0;
-  let lastTime = 0;
-  
-  for (const change of sortedChanges) {
-    if (time <= change.time) {
-      const bpm = getActiveChange(lastTime, sortedChanges).bpm;
-      accumulatedBeats += (time - lastTime) * (bpm / 60);
-      return accumulatedBeats;
-    } else {
-      const bpm = getActiveChange(lastTime, sortedChanges).bpm;
-      accumulatedBeats += (change.time - lastTime) * (bpm / 60);
-      lastTime = change.time;
-    }
+  if (changes.length === 0) {
+    return time * (DEFAULT_BPM / 60);
   }
-  
-  const bpm = getActiveChange(lastTime, sortedChanges).bpm;
-  accumulatedBeats += (time - lastTime) * (bpm / 60);
-  return accumulatedBeats;
+
+  const activeChange = changes[findLastChangeIndexByTime(time, changes)];
+  return activeChange.startBeat + (time - activeChange.time) * (activeChange.bpm / 60);
 };
 
 export const getTimeAtBeat = (beat: number, changes: TimedBpmChange[]) => {
-  const sortedChanges = [...changes].sort((a, b) => a.time - b.time);
-  let accumulatedBeats = 0;
-  let lastTime = 0;
-  
-  for (const change of sortedChanges) {
-    const bpm = getActiveChange(lastTime, sortedChanges).bpm;
-    const beatsInInterval = (change.time - lastTime) * (bpm / 60);
-    
-    if (beat <= accumulatedBeats + beatsInInterval) {
-      return lastTime + (beat - accumulatedBeats) / (bpm / 60);
-    }
-    
-    accumulatedBeats += beatsInInterval;
-    lastTime = change.time;
+  if (changes.length === 0) {
+    return beat / (DEFAULT_BPM / 60);
   }
-  
-  const bpm = getActiveChange(lastTime, sortedChanges).bpm;
-  return lastTime + (beat - accumulatedBeats) / (bpm / 60);
+
+  const activeChange = changes[findLastChangeIndexByBeat(beat, changes)];
+  return activeChange.time + (beat - activeChange.startBeat) / (activeChange.bpm / 60);
 };
 
 export const formatTime = (time: number, changes: TimedBpmChange[]) => {
-  if (!changes || changes.length === 0) return '0:0.00/4';
+  if (!changes || changes.length === 0) return '0:0/4';
   
   const totalBeats = getBeatAtTime(time, changes);
   
@@ -95,7 +127,7 @@ export const formatTime = (time: number, changes: TimedBpmChange[]) => {
   while (measureCount < 10000) {
     const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, changes);
     const activeChange = getActiveChange(timeAtMeasure + 0.001, changes);
-    currentBeatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
+    currentBeatsPerMeasure = getBeatsPerMeasure(activeChange.timeSignature);
     
     if (totalBeats < currentMeasureBeat + currentBeatsPerMeasure) {
       break;
@@ -106,5 +138,11 @@ export const formatTime = (time: number, changes: TimedBpmChange[]) => {
   }
   
   const beatInMeasure = totalBeats - currentMeasureBeat;
-  return `${measureCount}:${beatInMeasure.toFixed(2)}/${currentBeatsPerMeasure}`;
+  const roundedBeatInMeasure = Math.round(beatInMeasure);
+
+  if (roundedBeatInMeasure >= currentBeatsPerMeasure) {
+    return `${measureCount + 1}:1/${currentBeatsPerMeasure}`;
+  }
+
+  return `${measureCount}:${roundedBeatInMeasure + 1}/${currentBeatsPerMeasure}`;
 };

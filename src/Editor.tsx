@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ArrowLeft, Settings, Play, Pause, Save, X, ChevronLeft, ChevronRight } from 'lucide-react';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from './utils/editorUtils';
@@ -51,6 +51,12 @@ interface HitSoundEvent {
   key: string;
 }
 
+interface PendingDragUpdate {
+  noteId: number;
+  lane: number;
+  time: number;
+}
+
 const getPreviousHoldConnectorId = (notes: Note[], time: number) => {
   const previousHoldConnector = notes
     .filter(note => HOLD_CONNECTOR_TYPES.includes(note.type) && note.time < time)
@@ -58,6 +64,32 @@ const getPreviousHoldConnectorId = (notes: Note[], time: number) => {
     .at(-1);
 
   return previousHoldConnector?.id ?? null;
+};
+
+const formatGroupedIds = (ids: number[]) => {
+  const sortedIds = [...ids].sort((a, b) => a - b);
+  const segments: string[] = [];
+  let rangeStart = sortedIds[0];
+  let previousId = sortedIds[0];
+
+  for (let index = 1; index <= sortedIds.length; index += 1) {
+    const currentId = sortedIds[index];
+    const continuesRange = currentId === previousId + 1;
+
+    if (continuesRange) {
+      previousId = currentId;
+      continue;
+    }
+
+    segments.push(
+      rangeStart === previousId ? `${rangeStart}` : `${rangeStart}-${previousId}`,
+    );
+
+    rangeStart = currentId;
+    previousId = currentId;
+  }
+
+  return segments.join(',');
 };
 
 export default function Editor({ 
@@ -77,6 +109,9 @@ export default function Editor({
   const MAX_PIXELS_PER_BEAT = 320;
   const [isModalOpen, setIsModalOpen] = useState(mode === 'new');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isExitWarningOpen, setIsExitWarningOpen] = useState(false);
+  const [isExitWarningEnabled, setIsExitWarningEnabled] = useState(true);
+  const [isScrollDirectionInverted, setIsScrollDirectionInverted] = useState(false);
   const [musicVolume, setMusicVolume] = useState(1);
   const [tapSoundVolume, setTapSoundVolume] = useState(1);
   const [flickSoundVolume, setFlickSoundVolume] = useState(1);
@@ -144,9 +179,21 @@ export default function Editor({
   const timeDisplayRef = useRef<HTMLDivElement>(null);
   const progressBarRef = useRef<HTMLInputElement>(null);
   const isDraggingProgress = useRef(false);
+  const pendingDragUpdateRef = useRef<PendingDragUpdate | null>(null);
+  const dragUpdateFrameRef = useRef<number>();
+  const hoverPreviewRef = useRef<HoverPreview | null>(null);
 
   const openSettings = () => {
     setIsSettingsOpen(true);
+  };
+
+  const openExitWarning = () => {
+    if (!isExitWarningEnabled) {
+      onBack();
+      return;
+    }
+
+    setIsExitWarningOpen(true);
   };
 
   const getAudioContextCtor = () => {
@@ -213,6 +260,10 @@ export default function Editor({
   }, [draggingNoteId, selectionBox]);
 
   useEffect(() => {
+    hoverPreviewRef.current = hoverPreview;
+  }, [hoverPreview]);
+
+  useEffect(() => {
     if (isCtrlHeld) {
       setHoverPreview(null);
     }
@@ -228,6 +279,46 @@ export default function Editor({
     const maxNoteId = notes.reduce((maxId, note) => Math.max(maxId, note.id), 0);
     nextNoteIdRef.current = maxNoteId + 1;
   }, [notes]);
+
+  const timedBpmChanges = useMemo(() => convertBpmChangesToTime(bpmChanges), [bpmChanges]);
+  const selectedNoteIdSet = useMemo(() => new Set(selectedNoteIds), [selectedNoteIds]);
+  const noteRenderIndex = useMemo(() => {
+    const notesById = new Map<number, Note>();
+    const noteBeats = new Map<number, number>();
+    const groupedNoteIds = new Map<string, number[]>();
+
+    notes.forEach((note) => {
+      notesById.set(note.id, note);
+      noteBeats.set(note.id, getBeatAtTime(note.time, timedBpmChanges));
+
+      const key = `${note.time.toFixed(6)}:${note.lane}`;
+      const groupedIds = groupedNoteIds.get(key);
+      if (groupedIds) {
+        groupedIds.push(note.id);
+      } else {
+        groupedNoteIds.set(key, [note.id]);
+      }
+    });
+
+    const groupedIdLabels = new Map<string, string>();
+    groupedNoteIds.forEach((groupedIds, key) => {
+      groupedIdLabels.set(key, formatGroupedIds(groupedIds));
+    });
+
+    const selectedParentNoteIds = new Set<number>();
+    notes.forEach((note) => {
+      if (selectedNoteIdSet.has(note.id) && note.parentId !== null) {
+        selectedParentNoteIds.add(note.parentId);
+      }
+    });
+
+    return {
+      notesById,
+      noteBeats,
+      groupedIdLabels,
+      selectedParentNoteIds,
+    };
+  }, [notes, timedBpmChanges, selectedNoteIdSet]);
 
   useEffect(() => {
     const hitSoundEventsByKey = new Map<string, HitSoundEvent>();
@@ -255,6 +346,14 @@ export default function Editor({
     };
     window.addEventListener('mouseup', handleMouseUp);
     return () => window.removeEventListener('mouseup', handleMouseUp);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (dragUpdateFrameRef.current) {
+        cancelAnimationFrame(dragUpdateFrameRef.current);
+      }
+    };
   }, []);
 
   const handleConfirm = () => {
@@ -400,7 +499,7 @@ export default function Editor({
     const targetTime = parseFloat(e.target.value);
 
     // Snap to grid
-    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+    const sortedChanges = timedBpmChanges;
     const targetBeat = getBeatAtTime(targetTime, sortedChanges);
     const snappedBeat = Math.round(targetBeat * gridZoom) / gridZoom;
     const newTime = getTimeAtBeat(snappedBeat, sortedChanges);
@@ -600,16 +699,35 @@ export default function Editor({
     const container = containerRef.current;
     if (!canvas || !container) return;
 
+    const now = performance.now();
+    fpsFrameCountRef.current += 1;
+    const elapsed = now - fpsWindowStartRef.current;
+    if (elapsed >= 500) {
+      setFps(Math.round((fpsFrameCountRef.current * 1000) / elapsed));
+      fpsFrameCountRef.current = 0;
+      fpsWindowStartRef.current = now;
+    }
+
     const rect = container.getBoundingClientRect();
-    if (canvas.width !== rect.width || canvas.height !== rect.height) {
-      canvas.width = rect.width;
-      canvas.height = rect.height;
+    const displayWidth = Math.max(1, Math.floor(rect.width));
+    const displayHeight = Math.max(1, Math.floor(rect.height));
+    const dpr = window.devicePixelRatio || 1;
+    const pixelWidth = Math.floor(displayWidth * dpr);
+    const pixelHeight = Math.floor(displayHeight * dpr);
+
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+      canvas.style.width = `${displayWidth}px`;
+      canvas.style.height = `${displayHeight}px`;
     }
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const { width, height } = canvas;
+    const width = displayWidth;
+    const height = displayHeight;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
     let objectCount = 0;
 
@@ -695,35 +813,9 @@ export default function Editor({
       ctx.fillText(letter, centerX, centerY);
     };
 
-    const formatGroupedIds = (ids: number[]) => {
-      const sortedIds = [...ids].sort((a, b) => a - b);
-      const segments: string[] = [];
-      let rangeStart = sortedIds[0];
-      let previousId = sortedIds[0];
-
-      for (let index = 1; index <= sortedIds.length; index += 1) {
-        const currentId = sortedIds[index];
-        const continuesRange = currentId === previousId + 1;
-
-        if (continuesRange) {
-          previousId = currentId;
-          continue;
-        }
-
-        segments.push(
-          rangeStart === previousId ? `${rangeStart}` : `${rangeStart}-${previousId}`,
-        );
-
-        rangeStart = currentId;
-        previousId = currentId;
-      }
-
-      return segments.join(',');
-    };
-
     if (!projectData) return;
 
-    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+    const sortedChanges = timedBpmChanges;
     const offsetInSeconds = parseFloat(offset.toString()) / 1000;
 
     const activeChange = getActiveChange(stateRef.current.currentTime, sortedChanges);
@@ -829,34 +921,42 @@ export default function Editor({
       }
     }
 
-    // Draw BPM/Time Signature change indicators
+    const indicatorX = startX + gridWidth + 10;
+    const indicatorOffset = 6;
+    const bpmIndicatorKeys = new Set<string>();
+
+    // Draw BPM/Time Signature change indicators on the right side.
     sortedChanges.forEach(change => {
       const changeBeat = getBeatAtTime(change.time, sortedChanges);
       const y = hitLineY - (changeBeat - currentBeat) * pixelsPerBeat;
       
       // Only draw indicators that are not at time 0 (as they are implied)
       if (change.time > 0 && y > 0 && y < height) {
+        const indicatorKey = `${change.measure}:${change.beat}`;
+        bpmIndicatorKeys.add(indicatorKey);
+        const sharesTimeWithSpeed = stateRef.current.speedChanges.some(sc => `${sc.measure}:${sc.beat}` === indicatorKey);
         ctx.fillStyle = '#f59e0b';
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`BPM: ${change.bpm} | ${change.timeSignature}`, startX + gridWidth + 10, y);
+        ctx.fillText(`BPM: ${change.bpm} | ${change.timeSignature}`, indicatorX, y + (sharesTimeWithSpeed ? indicatorOffset : 0));
         objectCount += 1;
       }
     });
 
-    // Draw Speed change indicators
+    // Draw speed change indicators on the right side, above BPM changes at the same time position.
     stateRef.current.speedChanges.forEach(sc => {
       // Approximation: assuming 4 beats per measure for SC indicator position
       const scBeat = sc.measure * 4 + sc.beat;
       const y = hitLineY - (scBeat - currentBeat) * pixelsPerBeat;
       
       if (y > 0 && y < height) {
+        const sharesTimeWithBpm = bpmIndicatorKeys.has(`${sc.measure}:${sc.beat}`);
         ctx.fillStyle = '#06b6d4'; // teal-500
         ctx.font = '10px Inter, sans-serif';
-        ctx.textAlign = 'right';
+        ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`SC: ${sc.speedChange.toFixed(1)}x`, startX - 10, y);
+        ctx.fillText(`SC: ${sc.speedChange.toFixed(1)}x`, indicatorX, y - (sharesTimeWithBpm ? indicatorOffset : 0));
         objectCount += 1;
       }
     });
@@ -867,13 +967,17 @@ export default function Editor({
         return;
       }
 
-      const parentNote = stateRef.current.notes.find(n => n.id === note.parentId);
+      const parentNote = noteRenderIndex.notesById.get(note.parentId);
       if (!parentNote) {
         return;
       }
 
-      const noteBeat = getBeatAtTime(note.time, sortedChanges);
-      const parentBeat = getBeatAtTime(parentNote.time, sortedChanges);
+      const noteBeat = noteRenderIndex.noteBeats.get(note.id);
+      const parentBeat = noteRenderIndex.noteBeats.get(parentNote.id);
+      if (noteBeat === undefined || parentBeat === undefined) {
+        return;
+      }
+
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       const parentY = hitLineY - (parentBeat - currentBeat) * pixelsPerBeat;
 
@@ -895,25 +999,13 @@ export default function Editor({
       objectCount += 1;
     });
 
-    const notesAtPosition = new Map<string, number[]>();
-    stateRef.current.notes.forEach((note) => {
-      const key = `${note.time.toFixed(6)}:${note.lane}`;
-      const groupedIds = notesAtPosition.get(key);
-      if (groupedIds) {
-        groupedIds.push(note.id);
-      } else {
-        notesAtPosition.set(key, [note.id]);
-      }
-    });
-    const selectedParentNoteIds = new Set(
-      stateRef.current.notes
-        .filter((note) => selectedNoteIds.includes(note.id) && note.parentId !== null)
-        .map((note) => note.parentId as number),
-    );
-
     // Draw notes
     stateRef.current.notes.forEach(note => {
-      const noteBeat = getBeatAtTime(note.time, sortedChanges);
+      const noteBeat = noteRenderIndex.noteBeats.get(note.id);
+      if (noteBeat === undefined) {
+        return;
+      }
+
       const y = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       
       if (y > -50 && y < height + 50) {
@@ -978,12 +1070,12 @@ export default function Editor({
         }
 
         // Highlight if selected
-        if (selectedNoteIds.includes(note.id)) {
+        if (selectedNoteIdSet.has(note.id)) {
           ctx.setLineDash([]);
           ctx.strokeStyle = '#ff00ff';
           ctx.lineWidth = 4;
           ctx.strokeRect(x, y - 12, notePixelWidth, 24);
-        } else if (selectedParentNoteIds.has(note.id)) {
+        } else if (noteRenderIndex.selectedParentNoteIds.has(note.id)) {
           ctx.setLineDash([6, 4]);
           ctx.strokeStyle = '#ff00ff';
           ctx.lineWidth = 3;
@@ -996,8 +1088,8 @@ export default function Editor({
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        const groupedIds = notesAtPosition.get(`${note.time.toFixed(6)}:${note.lane}`) || [note.id];
-        ctx.fillText(formatGroupedIds(groupedIds), x + notePixelWidth / 2, y + 12);
+        const groupedIdsLabel = noteRenderIndex.groupedIdLabels.get(`${note.time.toFixed(6)}:${note.lane}`) ?? `${note.id}`;
+        ctx.fillText(groupedIdsLabel, x + notePixelWidth / 2, y + 12);
         objectCount += 1;
       }
     });
@@ -1110,19 +1202,11 @@ export default function Editor({
     objectCount += 1;
     renderedObjectsRef.current = objectCount;
 
-  }, [pixelsPerBeat, projectData, gridZoom, hoverPreview, isCtrlHeld, noteWidth, selectedNoteIds, selectedNoteType, selectionBox]);
+  }, [pixelsPerBeat, projectData, gridZoom, hoverPreview, isCtrlHeld, noteWidth, selectedNoteIdSet, selectedNoteType, selectionBox, timedBpmChanges, noteRenderIndex, offset]);
+
+  const shouldAnimateCanvas = isPlaying || (!!hoverPreview && !isCtrlHeld);
 
   const update = useCallback(() => {
-    const now = performance.now();
-    fpsFrameCountRef.current += 1;
-    const elapsed = now - fpsWindowStartRef.current;
-    if (elapsed >= 500) {
-      setFps(Math.round((fpsFrameCountRef.current * 1000) / elapsed));
-      fpsFrameCountRef.current = 0;
-      fpsWindowStartRef.current = now;
-      setRenderedObjects(renderedObjectsRef.current);
-    }
-
     if (stateRef.current.isPlaying && audioRef.current) {
       const offsetInSeconds = parseFloat(offset.toString()) / 1000;
       const currentTime = audioRef.current.currentTime + offsetInSeconds;
@@ -1130,6 +1214,11 @@ export default function Editor({
       const lastTime = lastPlayedTimeRef.current;
 
       if (currentTime + HIT_SOUND_JUMP_TOLERANCE_SECONDS < lastTime) {
+        hitSoundCursorRef.current = findHitSoundCursor(currentTime);
+        scheduledHitSoundKeysRef.current.clear();
+      }
+
+      if (currentTime - lastTime > HIT_SOUND_JUMP_TOLERANCE_SECONDS) {
         hitSoundCursorRef.current = findHitSoundCursor(currentTime);
         scheduledHitSoundKeysRef.current.clear();
       }
@@ -1158,15 +1247,41 @@ export default function Editor({
     }
 
     drawGrid();
-    requestRef.current = requestAnimationFrame(update);
-  }, [drawGrid, offset, playHitSound]); // Added offset to dependencies
+    setRenderedObjects(renderedObjectsRef.current);
+    if (stateRef.current.isPlaying || (hoverPreview && !isCtrlHeld)) {
+      requestRef.current = requestAnimationFrame(update);
+    } else {
+      requestRef.current = undefined;
+    }
+  }, [drawGrid, offset, playHitSound, hoverPreview, isCtrlHeld]);
 
   useEffect(() => {
-    requestRef.current = requestAnimationFrame(update);
+    if (!shouldAnimateCanvas) {
+      fpsFrameCountRef.current = 0;
+      fpsWindowStartRef.current = performance.now();
+      setFps(0);
+      setRenderedObjects(renderedObjectsRef.current);
+      drawGrid();
+      if (requestRef.current) {
+        cancelAnimationFrame(requestRef.current);
+        requestRef.current = undefined;
+      }
+      return;
+    }
+
+    if (!requestRef.current) {
+      fpsFrameCountRef.current = 0;
+      fpsWindowStartRef.current = performance.now();
+      requestRef.current = requestAnimationFrame(update);
+    }
+
     return () => {
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (requestRef.current) {
+        cancelAnimationFrame(requestRef.current);
+        requestRef.current = undefined;
+      }
     };
-  }, [update]);
+  }, [drawGrid, shouldAnimateCanvas, update]);
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -1198,7 +1313,7 @@ export default function Editor({
     const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
 
     const clickedNote = stateRef.current.notes.reduce<Note | null>((highestNote, note) => {
-      const noteBeat = getBeatAtTime(note.time, sortedChanges);
+      const noteBeat = noteRenderIndex.noteBeats.get(note.id) ?? getBeatAtTime(note.time, sortedChanges);
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       const noteStartX = startX + note.lane * laneWidth;
       const noteEndX = noteStartX + (laneWidth / 2) * note.width;
@@ -1280,7 +1395,7 @@ export default function Editor({
     const gridWidth = lanes * laneWidth;
     const startX = (width - gridWidth) / 2;
     const hitLineY = height - 150;
-    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+    const sortedChanges = timedBpmChanges;
     const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
 
     if (draggingNoteId) {
@@ -1293,16 +1408,35 @@ export default function Editor({
       if (snappedBeat < 0) return;
       
       const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
+      pendingDragUpdateRef.current = { noteId: draggingNoteId, lane, time: snappedTime };
 
-      setNotes(prev => prev.map(n => 
-        n.id === draggingNoteId 
-          ? { ...n, time: snappedTime, lane } 
-          : n
-      ));
+      if (!dragUpdateFrameRef.current) {
+        dragUpdateFrameRef.current = requestAnimationFrame(() => {
+          dragUpdateFrameRef.current = undefined;
+          const pendingUpdate = pendingDragUpdateRef.current;
+          if (!pendingUpdate) {
+            return;
+          }
+
+          setNotes((prev) => prev.map((note) => {
+            if (note.id !== pendingUpdate.noteId) {
+              return note;
+            }
+
+            if (note.time === pendingUpdate.time && note.lane === pendingUpdate.lane) {
+              return note;
+            }
+
+            return { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane };
+          }));
+        });
+      }
     } else if (selectionBox) {
       setSelectionBox(prev => prev ? { ...prev, endX: clickX, endY: clickY } : null);
     } else if (e.ctrlKey || isCtrlHeld) {
-      setHoverPreview(null);
+      if (hoverPreviewRef.current !== null) {
+        setHoverPreview(null);
+      }
     } else if (clickX >= startX && clickX < startX + gridWidth) {
       let lane = Math.floor((clickX - startX) / laneWidth);
       lane = Math.max(0, Math.min(lanes - 1, lane));
@@ -1311,18 +1445,46 @@ export default function Editor({
       const snappedBeat = Math.round(clickBeat * gridZoom) / gridZoom;
 
       if (snappedBeat < 0) {
-        setHoverPreview(null);
+        if (hoverPreviewRef.current !== null) {
+          setHoverPreview(null);
+        }
         return;
       }
 
       const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
-      setHoverPreview({ lane, time: snappedTime });
+      const nextPreview = { lane, time: snappedTime };
+      const currentPreview = hoverPreviewRef.current;
+      if (!currentPreview || currentPreview.lane !== nextPreview.lane || Math.abs(currentPreview.time - nextPreview.time) > 0.000001) {
+        setHoverPreview(nextPreview);
+      }
     } else {
-      setHoverPreview(null);
+      if (hoverPreviewRef.current !== null) {
+        setHoverPreview(null);
+      }
     }
   };
 
   const handleCanvasMouseUp = () => {
+    if (dragUpdateFrameRef.current) {
+      cancelAnimationFrame(dragUpdateFrameRef.current);
+      dragUpdateFrameRef.current = undefined;
+    }
+    const pendingUpdate = pendingDragUpdateRef.current;
+    if (pendingUpdate) {
+      setNotes((prev) => prev.map((note) => {
+        if (note.id !== pendingUpdate.noteId) {
+          return note;
+        }
+
+        if (note.time === pendingUpdate.time && note.lane === pendingUpdate.lane) {
+          return note;
+        }
+
+        return { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane };
+      }));
+      pendingDragUpdateRef.current = null;
+    }
+
     if (selectionBox) {
       const canvas = canvasRef.current;
       if (canvas) {
@@ -1373,7 +1535,8 @@ export default function Editor({
     
     const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
     const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
-    const targetBeat = currentBeat + (e.deltaY / pixelsPerBeat);
+    const scrollDelta = isScrollDirectionInverted ? -e.deltaY : e.deltaY;
+    const targetBeat = currentBeat + (scrollDelta / pixelsPerBeat);
     
     // Snap to grid
     const snappedBeat = Math.round(targetBeat * gridZoom) / gridZoom;
@@ -1458,7 +1621,6 @@ export default function Editor({
     selectedSingleNote?.parentId === null || selectedSingleNote?.parentId === undefined
       ? null
       : notes.find((note) => note.id === selectedSingleNote.parentId) || null;
-  const timedBpmChanges = convertBpmChangesToTime(bpmChanges);
   const getTimeposFromTime = (time: number) => {
     const totalBeats = getBeatAtTime(time, timedBpmChanges);
     let currentMeasureBeat = 0;
@@ -1579,6 +1741,58 @@ export default function Editor({
       />
 
       <AnimatePresence>
+        {isExitWarningOpen && (
+          <motion.div
+            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/55 p-4 backdrop-blur-md"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            onMouseDown={() => setIsExitWarningOpen(false)}
+          >
+            <motion.div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="exit-warning-title"
+              className="flex w-full max-w-md flex-col overflow-hidden rounded-3xl border border-white/10 bg-neutral-950/90 shadow-2xl shadow-black/50"
+              initial={{ opacity: 0, y: 28, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 20, scale: 0.96 }}
+              transition={{ type: 'spring', stiffness: 320, damping: 30 }}
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <div className="border-b border-white/10 bg-gradient-to-br from-neutral-900 to-neutral-950 px-6 py-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.3em] text-amber-400/80">Warning</p>
+                <h2 id="exit-warning-title" className="mt-2 text-2xl font-semibold text-white">Leave the editor?</h2>
+              </div>
+
+              <div className="px-6 py-6">
+                <p className="text-sm leading-6 text-neutral-300">
+                  All unsaved or unexported work will be lost if you go back to the landing page.
+                </p>
+              </div>
+
+              <div className="flex gap-3 border-t border-white/10 p-4">
+                <button
+                  onClick={() => {
+                    setIsExitWarningOpen(false);
+                    onBack();
+                  }}
+                  className="flex-1 rounded-2xl bg-red-500 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-red-400"
+                >
+                  Quit
+                </button>
+                <button
+                  onClick={() => setIsExitWarningOpen(false)}
+                  className="flex-1 rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm font-semibold text-neutral-200 transition-colors hover:bg-white/[0.08]"
+                >
+                  Cancel
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+
         {isSettingsOpen && (
           <motion.div
             className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-4 backdrop-blur-md"
@@ -1605,6 +1819,75 @@ export default function Editor({
               </div>
 
               <div className="flex flex-1 flex-col gap-5 px-6 py-6">
+                <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+                  <div className="mb-5 flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-white">Editor</h3>
+                      <p className="mt-1 text-xs text-neutral-500">Control editor behavior and navigation safeguards.</p>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-neutral-950/60 p-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className="text-sm font-medium text-white">Back to Landing warning</p>
+                        <p className="mt-1 text-xs leading-5 text-neutral-500">
+                          Show a confirmation popup before leaving the editor and discarding unexported work.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={isExitWarningEnabled}
+                        aria-label="Toggle Back to Landing warning"
+                        onClick={() => setIsExitWarningEnabled((current) => !current)}
+                        className={`relative inline-flex h-7 w-14 shrink-0 items-center rounded-full border transition-colors ${
+                          isExitWarningEnabled
+                            ? 'border-emerald-300/40 bg-emerald-500/90'
+                            : 'border-white/10 bg-neutral-800'
+                        }`}
+                      >
+                        <span className="sr-only">Back to Landing warning</span>
+                        <span
+                          className={`absolute left-1 top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-white shadow-sm transition-transform ${
+                            isExitWarningEnabled ? 'translate-x-7' : 'translate-x-0'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-white/10 bg-neutral-950/60 p-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className="text-sm font-medium text-white">Invert Scroll Direction</p>
+                        <p className="mt-1 text-xs leading-5 text-neutral-500">
+                          Reverse mouse wheel scrolling when moving through the editor canvas.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={isScrollDirectionInverted}
+                        aria-label="Toggle inverted canvas scroll direction"
+                        onClick={() => setIsScrollDirectionInverted((current) => !current)}
+                        className={`relative inline-flex h-7 w-14 shrink-0 items-center rounded-full border transition-colors ${
+                          isScrollDirectionInverted
+                            ? 'border-emerald-300/40 bg-emerald-500/90'
+                            : 'border-white/10 bg-neutral-800'
+                        }`}
+                      >
+                        <span className="sr-only">Invert Scroll Direction</span>
+                        <span
+                          className={`absolute left-1 top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-white shadow-sm transition-transform ${
+                            isScrollDirectionInverted ? 'translate-x-7' : 'translate-x-0'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+                </section>
+
                 <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
                   <div className="mb-5 flex items-center justify-between">
                     <div>
@@ -1684,7 +1967,7 @@ export default function Editor({
       <header className="h-14 border-b border-neutral-800 bg-neutral-900/50 flex items-center justify-between px-4 shrink-0">
         <div className="flex items-center gap-4 w-1/3">
           <button
-            onClick={onBack}
+            onClick={openExitWarning}
             className="p-2 hover:bg-neutral-800 rounded-lg transition-colors text-neutral-400 hover:text-white"
             title="Back to Landing"
           >
@@ -1694,23 +1977,35 @@ export default function Editor({
           <h1 className="font-medium text-sm truncate">{projectData?.songName || 'Untitled Project'}</h1>
         </div>
         
-        {/* Progress Bar */}
-        <div className="flex-1 flex items-center justify-center px-4 max-w-xl">
+        {/* Transport */}
+        <div className="flex-1 flex items-center justify-center px-4 max-w-xl gap-3">
           {projectData && (
-            <input 
-              ref={progressBarRef}
-              type="range" 
-              min={0} 
-              max={duration || 100} 
-              step={0.01}
-              defaultValue={0}
-              onMouseDown={() => { isDraggingProgress.current = true; }}
-              onMouseUp={() => { isDraggingProgress.current = false; }}
-              onTouchStart={() => { isDraggingProgress.current = true; }}
-              onTouchEnd={() => { isDraggingProgress.current = false; }}
-              onChange={handleSeekChange}
-              className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-            />
+            <>
+              <button 
+                onClick={togglePlay}
+                className={`shrink-0 p-2 rounded-lg transition-colors ${isPlaying ? 'bg-emerald-500/20 text-emerald-400' : 'hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400'}`} 
+                title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+              >
+                {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+              </button>
+              <input 
+                ref={progressBarRef}
+                type="range" 
+                min={0} 
+                max={duration || 100} 
+                step={0.01}
+                defaultValue={0}
+                onMouseDown={() => { isDraggingProgress.current = true; }}
+                onMouseUp={() => { isDraggingProgress.current = false; }}
+                onTouchStart={() => { isDraggingProgress.current = true; }}
+                onTouchEnd={() => { isDraggingProgress.current = false; }}
+                onChange={handleSeekChange}
+                className="min-w-0 flex-1 h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+              />
+              <div ref={timeDisplayRef} className="shrink-0 text-sm font-mono text-neutral-400">
+                {formatTime(currentTime, convertBpmChangesToTime(bpmChanges))}
+              </div>
+            </>
           )}
         </div>
 
@@ -1722,9 +2017,6 @@ export default function Editor({
               </div>
               <div className="text-sm font-mono text-neutral-400 w-24 text-left">
                 Zoom <span className="inline-block w-10 text-center">{pixelsPerBeat}px</span>
-              </div>
-              <div ref={timeDisplayRef} className="text-sm font-mono text-neutral-400 mr-4">
-                {formatTime(currentTime, convertBpmChangesToTime(bpmChanges))}
               </div>
             </>
           )}
@@ -1747,13 +2039,6 @@ export default function Editor({
             title="Save Level"
           >
             <Save className="w-4 h-4" />
-          </button>
-          <button 
-            onClick={togglePlay}
-            className={`p-2 rounded-lg transition-colors ${isPlaying ? 'bg-emerald-500/20 text-emerald-400' : 'hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400'}`} 
-            title={isPlaying ? "Pause (Space)" : "Play (Space)"}
-          >
-            {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
           </button>
           <button className="flex items-center gap-2 px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg transition-colors text-sm font-medium ml-2">
             <Save className="w-4 h-4" />
@@ -1781,9 +2066,13 @@ export default function Editor({
       <main className="flex-1 flex overflow-hidden min-h-0">
         {/* Left Sidebar - General Functions */}
         <aside className={`${isLeftPanelCompact ? 'w-12' : 'w-64'} shrink-0 border-r border-neutral-800 bg-neutral-900/30 flex flex-col transition-all duration-300 overflow-hidden`}>
-          <div className="p-2 border-b border-neutral-800 flex justify-center">
-            <button onClick={() => setIsLeftPanelCompact(!isLeftPanelCompact)} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
+          <div className={`p-2 border-b border-neutral-800 flex ${isLeftPanelCompact ? 'justify-center' : 'justify-start'}`}>
+            <button
+              onClick={() => setIsLeftPanelCompact(!isLeftPanelCompact)}
+              className={`flex items-center gap-2 rounded text-neutral-400 hover:bg-neutral-800 hover:text-white transition-colors ${isLeftPanelCompact ? 'p-1' : 'px-2 py-1 text-xs font-medium'}`}
+            >
               {isLeftPanelCompact ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+              {!isLeftPanelCompact && <span>Collapse Window</span>}
             </button>
           </div>
           {!isLeftPanelCompact && activeLeftPanel === 'main' && (
@@ -2118,8 +2407,12 @@ export default function Editor({
               canvasRef={canvasRef}
               containerRef={containerRef}
               projectData={projectData}
+              bpmChanges={bpmChanges}
+              speedChanges={speedChanges}
               gridZoom={gridZoom}
               pixelsPerBeat={pixelsPerBeat}
+              currentTime={currentTime}
+              offset={offset}
               stateRef={stateRef}
               selectedNoteIds={selectedNoteIds}
               selectionBox={selectionBox}
@@ -2138,9 +2431,13 @@ export default function Editor({
 
         {/* Right Sidebar - Properties */}
         <aside className={`${isRightPanelCompact ? 'w-12' : 'w-64'} shrink-0 border-l border-neutral-800 bg-neutral-900/30 flex flex-col transition-all duration-300 overflow-hidden`}>
-          <div className="p-2 border-b border-neutral-800 flex justify-center">
-            <button onClick={() => setIsRightPanelCompact(!isRightPanelCompact)} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
+          <div className={`p-2 border-b border-neutral-800 flex ${isRightPanelCompact ? 'justify-center' : 'justify-start'}`}>
+            <button
+              onClick={() => setIsRightPanelCompact(!isRightPanelCompact)}
+              className={`flex items-center gap-2 rounded text-neutral-400 hover:bg-neutral-800 hover:text-white transition-colors ${isRightPanelCompact ? 'p-1' : 'px-2 py-1 text-xs font-medium'}`}
+            >
               {isRightPanelCompact ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+              {!isRightPanelCompact && <span>Collapse Window</span>}
             </button>
           </div>
           {!isRightPanelCompact && (
