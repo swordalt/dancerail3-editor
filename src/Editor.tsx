@@ -604,6 +604,7 @@ export default function Editor({
   const hoverPreviewRef = useRef<HoverPreview | null>(null);
   const playRequestIdRef = useRef(0);
   const playTimeoutRef = useRef<number>();
+  const isLoopingPlaybackRef = useRef(false);
 
   const renderPausedTimelineAtFullFps = useCallback(() => {
     pausedTimelineRenderUntilRef.current = performance.now() + PAUSED_TIMELINE_RENDER_DURATION_MS;
@@ -1150,6 +1151,63 @@ export default function Editor({
     }
   });
 
+  const loopPlaybackToBeginning = useCallback(async () => {
+    const audio = audioRef.current;
+    if (!audio || !projectData || isLoopingPlaybackRef.current) return;
+
+    isLoopingPlaybackRef.current = true;
+    const playRequestId = playRequestIdRef.current + 1;
+    playRequestIdRef.current = playRequestId;
+    clearPlayTimeout();
+    stopHitsounds();
+
+    const loopStartTime = 0;
+    const now = performance.now();
+    const offsetInSeconds = parseFloat(offset.toString()) / 1000;
+    const activePlaybackSpeed = stateRef.current.playbackSpeed;
+    const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+
+    setCurrentTime(loopStartTime);
+    setLiveStatsTime(loopStartTime);
+    stateRef.current.currentTime = loopStartTime;
+    stateRef.current.playbackStartTime = loopStartTime;
+    stateRef.current.playbackStartPerformanceTime = now;
+    stateRef.current.playbackAudioClockReadyTime = now + AUDIO_CLOCK_HANDOFF_DELAY_MS;
+    stateRef.current.isPlaying = true;
+    lastPlayedTimeRef.current = loopStartTime;
+    hitSoundCursorRef.current = findHitSoundCursor(loopStartTime);
+    scheduledHitSoundKeysRef.current.clear();
+
+    if (timeDisplayRef.current) {
+      timeDisplayRef.current.textContent = formatTime(loopStartTime, sortedChanges);
+    }
+    if (progressBarRef.current && !isDraggingProgress.current) {
+      progressBarRef.current.value = loopStartTime.toString();
+    }
+
+    applyAudioPlaybackSpeed(audio, activePlaybackSpeed);
+
+    if (offsetInSeconds > 0) {
+      audio.pause();
+      audio.currentTime = 0;
+      playTimeoutRef.current = window.setTimeout(() => {
+        playTimeoutRef.current = undefined;
+        if (playRequestIdRef.current === playRequestId && stateRef.current.isPlaying && audioRef.current) {
+          applyAudioPlaybackSpeed(audioRef.current, stateRef.current.playbackSpeed);
+          audioRef.current.play().catch(() => {});
+        }
+      }, (offsetInSeconds / activePlaybackSpeed) * 1000);
+      isLoopingPlaybackRef.current = false;
+      return;
+    }
+
+    await seekAudioToTime(audio, -offsetInSeconds);
+    if (playRequestIdRef.current === playRequestId && stateRef.current.isPlaying) {
+      await audio.play().catch(() => {});
+    }
+    isLoopingPlaybackRef.current = false;
+  }, [offset, projectData]);
+
   const togglePlay = useCallback(async () => {
     if (!audioRef.current || !projectData) return;
     const offsetInSeconds = parseFloat(offset.toString()) / 1000;
@@ -1584,10 +1642,29 @@ export default function Editor({
     }
 
     const indicatorX = startX + gridWidth + 10;
-    const indicatorOffset = 6;
-    const bpmIndicatorKeys = new Set<string>();
+    const indicatorLineHeight = 13;
+    const indicatorGroups = new Map<string, {
+      anchorY: number;
+      speedLabels: string[];
+      bpmLabels: string[];
+    }>();
 
-    // Draw BPM/Time Signature change indicators on the right side.
+    const getIndicatorGroup = (indicatorKey: string, anchorY: number) => {
+      const existingGroup = indicatorGroups.get(indicatorKey);
+      if (existingGroup) {
+        return existingGroup;
+      }
+
+      const nextGroup = {
+        anchorY,
+        speedLabels: [],
+        bpmLabels: [],
+      };
+      indicatorGroups.set(indicatorKey, nextGroup);
+      return nextGroup;
+    };
+
+    // Queue BPM/Time Signature change indicators on the right side.
     sortedChanges.forEach(change => {
       const changeBeat = getBeatAtTime(change.time, sortedChanges);
       const y = hitLineY - (changeBeat - currentBeat) * pixelsPerBeat;
@@ -1595,32 +1672,74 @@ export default function Editor({
       // Only draw indicators that are not at time 0 (as they are implied)
       if (change.time > 0 && y > 0 && y < height) {
         const indicatorKey = `${change.measure}:${change.beat}`;
-        bpmIndicatorKeys.add(indicatorKey);
-        const sharesTimeWithSpeed = stateRef.current.speedChanges.some(sc => `${sc.measure}:${sc.beat}` === indicatorKey);
-        ctx.fillStyle = '#f59e0b';
-        ctx.font = '10px Inter, sans-serif';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(`BPM: ${change.bpm} | ${change.timeSignature}`, indicatorX, y + (sharesTimeWithSpeed ? indicatorOffset : 0));
-        objectCount += 1;
+        getIndicatorGroup(indicatorKey, y).bpmLabels.push(`BPM: ${change.bpm} | ${change.timeSignature}`);
       }
     });
 
-    // Draw speed change indicators on the right side, above BPM changes at the same time position.
+    // Queue speed change indicators above BPM changes at the same time position.
     stateRef.current.speedChanges.forEach(sc => {
       // Approximation: assuming 4 beats per measure for SC indicator position
       const scBeat = sc.measure * 4 + sc.beat;
       const y = hitLineY - (scBeat - currentBeat) * pixelsPerBeat;
       
       if (y > 0 && y < height) {
-        const sharesTimeWithBpm = bpmIndicatorKeys.has(`${sc.measure}:${sc.beat}`);
-        ctx.fillStyle = '#06b6d4'; // teal-500
-        ctx.font = '10px Inter, sans-serif';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(`SC: ${sc.speedChange}x`, indicatorX, y - (sharesTimeWithBpm ? indicatorOffset : 0));
-        objectCount += 1;
+        const indicatorKey = `${sc.measure}:${sc.beat}`;
+        getIndicatorGroup(indicatorKey, y).speedLabels.push(`SC: ${sc.speedChange}x`);
       }
+    });
+
+    ctx.font = '10px Inter, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+
+    const indicatorStacks = Array.from(indicatorGroups.values()).map(group => {
+      const labels = [
+        ...group.speedLabels.map(text => ({ text, color: '#06b6d4' })),
+        ...group.bpmLabels.map(text => ({ text, color: '#f59e0b' })),
+      ];
+
+      const stackHeight = labels.length * indicatorLineHeight;
+      const minTop = 2;
+      const maxTop = Math.max(minTop, height - stackHeight - 2);
+      const centeredTop = group.anchorY - stackHeight / 2;
+
+      return {
+        labels,
+        height: stackHeight,
+        top: Math.min(Math.max(centeredTop, minTop), maxTop),
+      };
+    }).filter(stack => stack.labels.length > 0)
+      .sort((a, b) => a.top - b.top);
+
+    const indicatorGap = 2;
+    const minIndicatorTop = 2;
+    const maxIndicatorBottom = height - 2;
+    let previousBottom = minIndicatorTop - indicatorGap;
+
+    indicatorStacks.forEach(stack => {
+      stack.top = Math.max(stack.top, previousBottom + indicatorGap);
+      previousBottom = stack.top + stack.height;
+    });
+
+    const overflow = previousBottom - maxIndicatorBottom;
+    if (overflow > 0) {
+      indicatorStacks.forEach(stack => {
+        stack.top -= overflow;
+      });
+
+      previousBottom = minIndicatorTop - indicatorGap;
+      indicatorStacks.forEach(stack => {
+        stack.top = Math.max(stack.top, previousBottom + indicatorGap);
+        previousBottom = stack.top + stack.height;
+      });
+    }
+
+    indicatorStacks.forEach(stack => {
+      stack.labels.forEach((label, index) => {
+        ctx.fillStyle = label.color;
+        ctx.fillText(label.text, indicatorX, stack.top + index * indicatorLineHeight + indicatorLineHeight / 2);
+        objectCount += 1;
+      });
     });
 
     // Draw hold connections before note bodies so linked notes render on top.
@@ -1874,6 +1993,15 @@ export default function Editor({
       const activePlaybackSpeed = stateRef.current.playbackSpeed;
       const currentTime = getPlaybackTimeFromClock(audioRef.current, offsetInSeconds);
       const now = performance.now();
+
+      if (duration > 0 && currentTime >= duration) {
+        void loopPlaybackToBeginning();
+        drawGrid();
+        setRenderedObjects(renderedObjectsRef.current);
+        requestRef.current = requestAnimationFrame(update);
+        return;
+      }
+
       const scheduleUntil = currentTime + HIT_SOUND_LOOKAHEAD_SECONDS * activePlaybackSpeed;
       const lastTime = lastPlayedTimeRef.current;
 
@@ -1929,7 +2057,7 @@ export default function Editor({
     } else {
       requestRef.current = undefined;
     }
-  }, [drawGrid, offset, playHitSound, hoverPreview, isCtrlHeld, isShiftHeld, isPausedTimelineRendering, statisticsRefreshIntervalMs]);
+  }, [drawGrid, offset, playHitSound, hoverPreview, isCtrlHeld, isShiftHeld, isPausedTimelineRendering, statisticsRefreshIntervalMs, duration, loopPlaybackToBeginning]);
 
   useEffect(() => {
     if (!shouldAnimateCanvas) {
@@ -2717,7 +2845,6 @@ export default function Editor({
         <audio 
           ref={audioRef} 
           src={projectData.audioUrl} 
-          onEnded={() => setIsPlaying(false)} 
           onLoadedMetadata={(e) => {
             setDuration(e.currentTarget.duration);
             applyAudioPlaybackSpeed(e.currentTarget, stateRef.current.playbackSpeed);
