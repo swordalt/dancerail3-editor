@@ -92,6 +92,22 @@ const snapBeatToMeasureDivision = (
   return measureStartBeat + Math.round((beat - measureStartBeat) / step) * step;
 };
 
+const getBeatAtTimingPosition = (
+  measure: number,
+  beat: number,
+  timedBpmChanges: TimedBpmChange[],
+) => {
+  let currentMeasureBeat = 0;
+
+  for (let currentMeasure = 0; currentMeasure < measure; currentMeasure += 1) {
+    currentMeasureBeat += getBeatsPerMeasureAtBeat(currentMeasureBeat, timedBpmChanges);
+  }
+
+  return currentMeasureBeat + beat;
+};
+
+const getIndicatorKeyAtBeat = (beat: number) => beat.toFixed(6);
+
 interface EditorProps {
   onBack: () => void;
   mode?: EditorMode;
@@ -1539,24 +1555,23 @@ export default function Editor({
 
     // Queue BPM/Time Signature change indicators on the right side.
     sortedChanges.forEach(change => {
-      const changeBeat = getBeatAtTime(change.time, sortedChanges);
+      const changeBeat = change.startBeat;
       const y = hitLineY - (changeBeat - currentBeat) * pixelsPerBeat;
       
       // Only draw indicators that are not at time 0 (as they are implied)
       if (change.time > 0 && y > 0 && y < height) {
-        const indicatorKey = `${change.measure}:${change.beat}`;
+        const indicatorKey = getIndicatorKeyAtBeat(changeBeat);
         getIndicatorGroup(indicatorKey, y).bpmLabels.push(`BPM: ${change.bpm} | ${change.timeSignature}`);
       }
     });
 
     // Queue speed change indicators above BPM changes at the same time position.
     stateRef.current.speedChanges.forEach(sc => {
-      // Approximation: assuming 4 beats per measure for SC indicator position
-      const scBeat = sc.measure * 4 + sc.beat;
+      const scBeat = getBeatAtTimingPosition(sc.measure, sc.beat, sortedChanges);
       const y = hitLineY - (scBeat - currentBeat) * pixelsPerBeat;
       
       if (y > 0 && y < height) {
-        const indicatorKey = `${sc.measure}:${sc.beat}`;
+        const indicatorKey = getIndicatorKeyAtBeat(scBeat);
         getIndicatorGroup(indicatorKey, y).speedLabels.push(`SC: ${sc.speedChange}x`);
       }
     });
