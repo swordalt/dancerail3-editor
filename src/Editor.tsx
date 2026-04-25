@@ -325,6 +325,7 @@ export default function Editor({
   const fpsWindowStartRef = useRef(performance.now());
   const renderedObjectsRef = useRef(0);
   const liveStatsLastUpdateRef = useRef(0);
+  const shouldUpdateLiveStatsRef = useRef(false);
   const timeDisplayRef = useRef<HTMLDivElement>(null);
   const progressBarRef = useRef<HTMLInputElement>(null);
   const isDraggingProgress = useRef(false);
@@ -337,6 +338,7 @@ export default function Editor({
   const playRequestIdRef = useRef(0);
   const playTimeoutRef = useRef<number>();
   const isLoopingPlaybackRef = useRef(false);
+  const shouldShowChartStatistics = isRightPanelContentVisible && selectedNoteIds.length === 0;
 
   const renderPausedTimelineAtFullFps = useCallback(() => {
     pausedTimelineRenderUntilRef.current = performance.now() + PAUSED_TIMELINE_RENDER_DURATION_MS;
@@ -454,10 +456,19 @@ export default function Editor({
   }, [isPlaying, currentTime, projectData, bpmChanges, offset, notes, speedChanges, playbackSpeed]);
 
   useEffect(() => {
-    if (!isPlaying) {
+    if (!isPlaying && shouldShowChartStatistics) {
       setLiveStatsTime(currentTime);
     }
-  }, [currentTime, isPlaying]);
+  }, [currentTime, isPlaying, shouldShowChartStatistics]);
+
+  useEffect(() => {
+    shouldUpdateLiveStatsRef.current = shouldShowChartStatistics;
+
+    if (shouldShowChartStatistics) {
+      liveStatsLastUpdateRef.current = 0;
+      setLiveStatsTime(stateRef.current.currentTime);
+    }
+  }, [shouldShowChartStatistics]);
 
   const statisticsRefreshIntervalMs = useMemo(
     () => getStatisticsRefreshIntervalMs(statisticsRefreshRate),
@@ -1941,7 +1952,7 @@ export default function Editor({
       
       lastPlayedTimeRef.current = scheduleUntil;
 
-      if (now - liveStatsLastUpdateRef.current >= statisticsRefreshIntervalMs) {
+      if (shouldUpdateLiveStatsRef.current && now - liveStatsLastUpdateRef.current >= statisticsRefreshIntervalMs) {
         liveStatsLastUpdateRef.current = now;
         setLiveStatsTime(currentTime);
       }
@@ -2436,36 +2447,63 @@ export default function Editor({
       : notes.find((note) => note.id === selectedSingleNote.parentId) || null;
   const canEditSelectedNoteParent = selectedSingleNote ? canTypeHaveParent(selectedSingleNote.type) : false;
   const selectedNoteTimepos = selectedSingleNote ? getTimeposFromTime(selectedSingleNote.time) : 0;
-  const currentEditorTimepos = getTimeposFromTime(liveStatsTime);
-  const currentEditorBpm = getActiveChange(liveStatsTime, timedBpmChanges).bpm;
-  const sortedSpeedChanges = [...speedChanges].sort((a, b) => a.timepos - b.timepos);
-  const currentEditorSpeed = sortedSpeedChanges.reduce((activeSpeed, change) => (
-      change.timepos <= currentEditorTimepos
-        ? change.speedChange
-        : activeSpeed
-    ), 1);
-  const currentEditorDistanceState = sortedSpeedChanges.reduce((distanceState, change) => {
-    const changeTimepos = change.timepos;
-
-    if (changeTimepos > currentEditorTimepos) {
-      return distanceState;
+  const chartStatistics = useMemo(() => {
+    if (!shouldShowChartStatistics) {
+      return {
+        currentEditorBpm: 0,
+        currentEditorSpeed: 1,
+        currentEditorDistance: 0,
+        currentEditorCombo: 0,
+        currentEditorScore: 0,
+      };
     }
 
-    const clampedChangeTimepos = Math.max(distanceState.timepos, changeTimepos);
+    const currentEditorTimepos = getTimeposFromTime(liveStatsTime);
+    const currentEditorBpm = getActiveChange(liveStatsTime, timedBpmChanges).bpm;
+    const sortedSpeedChanges = [...speedChanges].sort((a, b) => a.timepos - b.timepos);
+    const currentEditorSpeed = sortedSpeedChanges.reduce((activeSpeed, change) => (
+        change.timepos <= currentEditorTimepos
+          ? change.speedChange
+          : activeSpeed
+      ), 1);
+    const currentEditorDistanceState = sortedSpeedChanges.reduce((distanceState, change) => {
+      const changeTimepos = change.timepos;
+
+      if (changeTimepos > currentEditorTimepos) {
+        return distanceState;
+      }
+
+      const clampedChangeTimepos = Math.max(distanceState.timepos, changeTimepos);
+      return {
+        distance: distanceState.distance + distanceState.speed * (clampedChangeTimepos - distanceState.timepos),
+        speed: change.speedChange,
+        timepos: clampedChangeTimepos,
+      };
+    }, { distance: 0, speed: 1, timepos: 0 });
+    const currentEditorDistance = currentEditorDistanceState.distance +
+      currentEditorDistanceState.speed * Math.max(0, currentEditorTimepos - currentEditorDistanceState.timepos);
+    const currentEditorCombo = notes.reduce((combo, note) => (
+      note.time <= liveStatsTime ? combo + 1 : combo
+    ), 0);
+    const currentEditorScore = notes.length > 0
+      ? Math.floor((3000000 / notes.length) * currentEditorCombo)
+      : 0;
+
     return {
-      distance: distanceState.distance + distanceState.speed * (clampedChangeTimepos - distanceState.timepos),
-      speed: change.speedChange,
-      timepos: clampedChangeTimepos,
+      currentEditorBpm,
+      currentEditorSpeed,
+      currentEditorDistance,
+      currentEditorCombo,
+      currentEditorScore,
     };
-  }, { distance: 0, speed: 1, timepos: 0 });
-  const currentEditorDistance = currentEditorDistanceState.distance +
-    currentEditorDistanceState.speed * Math.max(0, currentEditorTimepos - currentEditorDistanceState.timepos);
-  const currentEditorCombo = notes.reduce((combo, note) => (
-    note.time <= liveStatsTime ? combo + 1 : combo
-  ), 0);
-  const currentEditorScore = notes.length > 0
-    ? Math.floor((3000000 / notes.length) * currentEditorCombo)
-    : 0;
+  }, [getTimeposFromTime, liveStatsTime, notes, shouldShowChartStatistics, speedChanges, timedBpmChanges]);
+  const {
+    currentEditorBpm,
+    currentEditorSpeed,
+    currentEditorDistance,
+    currentEditorCombo,
+    currentEditorScore,
+  } = chartStatistics;
   const notePropertyInputClass = 'w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none disabled:cursor-not-allowed disabled:border-neutral-800 disabled:bg-neutral-900 disabled:text-neutral-600';
   const emptyCanvasMessage = mode === 'import'
     ? 'Provide the music file in Chart Metadata to start editing this imported chart.'
