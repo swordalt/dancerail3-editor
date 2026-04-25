@@ -61,9 +61,7 @@ export const formatNoteName = (note: Note) => NOTE_TYPES[note.type]?.name || `Ty
 
 export const formatNoteLane = (lane: number) => formatHistoryNumber(lane + 1);
 
-export const formatTimingPosition = (measure: number, beat: number) => (
-  `Measure ${measure}, Beat ${beat}`
-);
+export const formatTimingPosition = (timepos: number) => `Timepos ${formatHistoryNumber(timepos)}`;
 
 export const operationCategoryStyles: Record<OperationCategory, string> = {
   note: 'border-sky-500/30 bg-sky-500/10 text-sky-200',

@@ -5,6 +5,15 @@ const DEFAULT_TIME_SIGNATURE = '4/4';
 
 const getBeatsPerMeasure = (timeSignature: string) => parseInt(timeSignature.split('/')[0], 10) || 4;
 
+export const getBpmChangeTimepos = (change: BpmChange) => {
+  if (Number.isFinite(change.timepos)) {
+    return change.timepos;
+  }
+
+  const legacyChange = change as BpmChange & { measure?: number; beat?: number };
+  return (legacyChange.measure ?? 0) + (legacyChange.beat ?? 0) / 4;
+};
+
 const findLastChangeIndexByTime = (time: number, changes: TimedBpmChange[]) => {
   let low = 0;
   let high = changes.length - 1;
@@ -42,17 +51,16 @@ const findLastChangeIndexByBeat = (beat: number, changes: TimedBpmChange[]) => {
 };
 
 export const convertBpmChangesToTime = (changes: BpmChange[]): TimedBpmChange[] => {
-  const sortedChanges = [...changes].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
+  const sortedChanges = [...changes].sort((a, b) => getBpmChangeTimepos(a) - getBpmChangeTimepos(b));
   const timeChanges: TimedBpmChange[] = [];
   
   let currentTime = 0;
   let currentBeat = 0;
-  let lastMeasure = 0;
-  let lastBeat = 0;
+  let lastTimepos = 0;
   let lastBpm = DEFAULT_BPM;
   let lastTimeSignature = DEFAULT_TIME_SIGNATURE;
 
-  if (sortedChanges.length === 0 || sortedChanges[0].measure !== 0 || sortedChanges[0].beat !== 0) {
+  if (sortedChanges.length === 0 || getBpmChangeTimepos(sortedChanges[0]) !== 0) {
     timeChanges.push({
       time: 0,
       startBeat: 0,
@@ -62,8 +70,9 @@ export const convertBpmChangesToTime = (changes: BpmChange[]): TimedBpmChange[] 
   }
   
   for (const change of sortedChanges) {
+    const changeTimepos = getBpmChangeTimepos(change);
     const beatsPerMeasure = getBeatsPerMeasure(lastTimeSignature);
-    const beatsToNextChange = (change.measure - lastMeasure) * beatsPerMeasure + (change.beat - lastBeat);
+    const beatsToNextChange = (changeTimepos - lastTimepos) * beatsPerMeasure;
     
     currentTime += beatsToNextChange * (60 / lastBpm);
     currentBeat += beatsToNextChange;
@@ -75,8 +84,7 @@ export const convertBpmChangesToTime = (changes: BpmChange[]): TimedBpmChange[] 
       timeSignature: change.timeSignature,
     });
     
-    lastMeasure = change.measure;
-    lastBeat = change.beat;
+    lastTimepos = changeTimepos;
     lastBpm = change.bpm;
     lastTimeSignature = change.timeSignature;
   }

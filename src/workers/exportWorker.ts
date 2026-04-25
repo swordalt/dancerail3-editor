@@ -2,6 +2,7 @@ import { buildLevelText } from '../utils/levelFormat';
 import { createZipBuffer } from '../utils/zipExport';
 import type { ExportWorkerPayload, ExportWorkerRequest, ExportWorkerResponse } from '../types/exportTypes';
 import type { BpmChange } from '../types/editorTypes';
+import { getBpmChangeTimepos } from '../utils/editorUtils';
 
 const getFileExtension = (file: File) => {
   const extension = file.name.split('.').pop();
@@ -10,7 +11,7 @@ const getFileExtension = (file: File) => {
 
 const getFirstBpm = (bpmChanges: BpmChange[], fallbackBpm: number | undefined) => {
   const firstChange = [...bpmChanges]
-    .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat))[0];
+    .sort((a, b) => getBpmChangeTimepos(a) - getBpmChangeTimepos(b))[0];
 
   return firstChange?.bpm ?? fallbackBpm ?? 120;
 };

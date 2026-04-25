@@ -1,6 +1,6 @@
 import type { BpmChange, Note, ProjectData, SpeedChange } from '../types/editorTypes';
 import { HOLD_START_TYPES } from '../constants/editorConstants';
-import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat } from './editorUtils';
+import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getBpmChangeTimepos, getTimeAtBeat } from './editorUtils';
 
 interface ParsedLevelData {
   notes: Note[];
@@ -10,13 +10,11 @@ interface ParsedLevelData {
 }
 
 const DEFAULT_BPM_CHANGE: BpmChange = {
-  measure: 0,
-  beat: 0,
+  timepos: 0,
   bpm: 120,
   timeSignature: '4/4',
 };
 
-const TIMEPOS_PRECISION = 1000;
 const APPEAR_MODES = new Set(['L', 'R', 'H', 'P']);
 
 const parseIndexedNumericValue = (line: string, prefix: string) => {
@@ -33,13 +31,8 @@ const parseIndexedNumericValue = (line: string, prefix: string) => {
 };
 
 const convertTimeposToBpmChange = (timepos: number, bpm: number): BpmChange => {
-  const roundedUnits = Math.round(timepos * TIMEPOS_PRECISION);
-  const measure = Math.floor(roundedUnits / TIMEPOS_PRECISION);
-  const beatUnits = roundedUnits % TIMEPOS_PRECISION;
-
   return {
-    measure,
-    beat: (beatUnits / TIMEPOS_PRECISION) * 4,
+    timepos,
     bpm,
     timeSignature: '4/4',
   };
@@ -80,8 +73,7 @@ export function parseLevelText(text: string): ParsedLevelData {
         const speedChange = parseFloat(match[2]);
         const sci = parseFloat(sciMatch[2]);
         speedChanges.push({
-          measure: Math.floor(sci),
-          beat: (sci % 1) * 4,
+          timepos: sci,
           speedChange,
         });
       }
@@ -115,14 +107,14 @@ export function parseLevelText(text: string): ParsedLevelData {
 
     const bpmChanges = Array.from(bpmValues.entries())
       .map(([entryIndex, bpm]) => convertTimeposToBpmChange(bpmPositions.get(entryIndex) ?? 0, bpm))
-      .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat))
+      .sort((a, b) => getBpmChangeTimepos(a) - getBpmChangeTimepos(b))
       .filter((change, entryIndex, changes) => {
         if (entryIndex === 0) {
           return true;
         }
 
         const previous = changes[entryIndex - 1];
-        return previous.measure !== change.measure || previous.beat !== change.beat || previous.bpm !== change.bpm;
+        return getBpmChangeTimepos(previous) !== getBpmChangeTimepos(change) || previous.bpm !== change.bpm;
       });
 
     const timedBpmChanges = convertBpmChangesToTime(
@@ -145,14 +137,14 @@ export function parseLevelText(text: string): ParsedLevelData {
 
   const bpmChanges = Array.from(bpmValues.entries())
     .map(([index, bpm]) => convertTimeposToBpmChange(bpmPositions.get(index) ?? 0, bpm))
-    .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat))
+    .sort((a, b) => getBpmChangeTimepos(a) - getBpmChangeTimepos(b))
     .filter((change, index, changes) => {
       if (index === 0) {
         return true;
       }
 
       const previous = changes[index - 1];
-      return previous.measure !== change.measure || previous.beat !== change.beat || previous.bpm !== change.bpm;
+      return getBpmChangeTimepos(previous) !== getBpmChangeTimepos(change) || previous.bpm !== change.bpm;
     });
 
   return { notes, bpmChanges, speedChanges, offset };
@@ -178,8 +170,8 @@ export function buildLevelText(params: {
     return Number.isFinite(numericSpeed) ? formatNoteValue(numericSpeed) : normalizedSpeed;
   };
   const normalizedBpmChanges = [...(bpmChanges.length > 0 ? bpmChanges : [DEFAULT_BPM_CHANGE])]
-    .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
-  const formatTimepos = (change: BpmChange) => (change.measure + change.beat / 4).toFixed(3);
+    .sort((a, b) => getBpmChangeTimepos(a) - getBpmChangeTimepos(b));
+  const formatTimepos = (change: BpmChange) => getBpmChangeTimepos(change).toFixed(3);
 
   let content = `#OFFSET=${parseFloat(offset.toString()) / -1000};\n`;
   content += '#BEAT=1;\n';
@@ -192,7 +184,7 @@ export function buildLevelText(params: {
 
   speedChanges.forEach((change, index) => {
     content += `#SC [${index}]=${change.speedChange};\n`;
-    content += `#SCI[${index}]=${(change.measure + change.beat / 4).toFixed(3)};\n`;
+    content += `#SCI[${index}]=${change.timepos.toFixed(3)};\n`;
   });
 
   const sortedChanges = convertBpmChangesToTime(bpmChanges);

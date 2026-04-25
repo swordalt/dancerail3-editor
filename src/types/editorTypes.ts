@@ -17,8 +17,7 @@ export interface Note {
 }
 
 export interface BpmChange {
-  measure: number;
-  beat: number;
+  timepos: number;
   bpm: number;
   timeSignature: string;
 }
@@ -31,8 +30,7 @@ export interface TimedBpmChange {
 }
 
 export interface SpeedChange {
-  measure: number;
-  beat: number;
+  timepos: number;
   speedChange: number;
 }
 

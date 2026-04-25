@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ArrowLeft, Settings, Play, Pause, Download, X, ChevronLeft, ChevronRight, Grid2x2, Grid2x2X, HelpCircle } from 'lucide-react';
-import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from './utils/editorUtils';
+import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getBpmChangeTimepos, getTimeAtBeat, formatTime } from './utils/editorUtils';
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
 import CommitInput from './components/CommitInput';
@@ -92,18 +92,24 @@ const snapBeatToMeasureDivision = (
   return measureStartBeat + Math.round((beat - measureStartBeat) / step) * step;
 };
 
-const getBeatAtTimingPosition = (
-  measure: number,
-  beat: number,
+const getBeatAtTimepos = (
+  timepos: number,
   timedBpmChanges: TimedBpmChange[],
 ) => {
+  const measureCount = Math.max(0, Math.floor(timepos));
+  const measureDecimal = Math.max(0, timepos - measureCount);
   let currentMeasureBeat = 0;
+  let currentBeatsPerMeasure = 4;
 
-  for (let currentMeasure = 0; currentMeasure < measure; currentMeasure += 1) {
-    currentMeasureBeat += getBeatsPerMeasureAtBeat(currentMeasureBeat, timedBpmChanges);
+  for (let currentMeasure = 0; currentMeasure <= measureCount; currentMeasure += 1) {
+    currentBeatsPerMeasure = getBeatsPerMeasureAtBeat(currentMeasureBeat, timedBpmChanges);
+
+    if (currentMeasure < measureCount) {
+      currentMeasureBeat += currentBeatsPerMeasure;
+    }
   }
 
-  return currentMeasureBeat + beat;
+  return currentMeasureBeat + measureDecimal * currentBeatsPerMeasure;
 };
 
 const getIndicatorKeyAtBeat = (beat: number) => beat.toFixed(6);
@@ -409,8 +415,8 @@ export default function Editor({
     playbackAudioClockReadyTime: 0,
     playbackSpeed: 1,
     bpm: 120,
-    bpmChanges: [{ measure: 0, beat: 0, bpm: 120, timeSignature: '4/4' }],
-    speedChanges: [{ measure: 0, beat: 0, speedChange: 1 }],
+    bpmChanges: [{ timepos: 0, bpm: 120, timeSignature: '4/4' }],
+    speedChanges: [{ timepos: 0, speedChange: 1 }],
     offset: 0,
     notes: [],
   });
@@ -658,7 +664,7 @@ export default function Editor({
 
     // Imported charts can exist before project metadata is set, so only seed BPMs for actual new projects.
     if (!projectData && mode === 'new') {
-      setBpmChanges([{ measure: 0, beat: 0, bpm: nextBpm, timeSignature: '4/4' }]);
+      setBpmChanges([{ timepos: 0, bpm: nextBpm, timeSignature: '4/4' }]);
     }
 
     setIsModalOpen(false);
@@ -1007,10 +1013,10 @@ export default function Editor({
       stateRef.current.isPlaying = false;
       setIsPlaying(false);
 
-      // Snap back to the last whole beat the playhead passed.
+      // Snap to the nearest active timeline division.
       const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
       const currentBeat = getBeatAtTime(playbackTime, sortedChanges);
-      const snappedBeat = Math.floor(currentBeat);
+      const snappedBeat = snapBeatToMeasureDivision(currentBeat, gridZoom, sortedChanges);
       const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
       
       setCurrentTime(snappedTime);
@@ -1072,7 +1078,7 @@ export default function Editor({
       
       setIsPlaying(true);
     }
-  }, [prepareHitSounds, projectData, offset, setupMusicGain]);
+  }, [gridZoom, prepareHitSounds, projectData, offset, setupMusicGain]);
 
   useEffect(() => {
     const isOnlyKeyPressed = (e: KeyboardEvent) => (
@@ -1567,7 +1573,7 @@ export default function Editor({
 
     // Queue speed change indicators above BPM changes at the same time position.
     stateRef.current.speedChanges.forEach(sc => {
-      const scBeat = getBeatAtTimingPosition(sc.measure, sc.beat, sortedChanges);
+      const scBeat = getBeatAtTimepos(sc.timepos, sortedChanges);
       const y = hitLineY - (scBeat - currentBeat) * pixelsPerBeat;
       
       if (y > 0 && y < height) {
@@ -2432,14 +2438,14 @@ export default function Editor({
   const selectedNoteTimepos = selectedSingleNote ? getTimeposFromTime(selectedSingleNote.time) : 0;
   const currentEditorTimepos = getTimeposFromTime(liveStatsTime);
   const currentEditorBpm = getActiveChange(liveStatsTime, timedBpmChanges).bpm;
-  const sortedSpeedChanges = [...speedChanges].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
+  const sortedSpeedChanges = [...speedChanges].sort((a, b) => a.timepos - b.timepos);
   const currentEditorSpeed = sortedSpeedChanges.reduce((activeSpeed, change) => (
-      change.measure + change.beat / 4 <= currentEditorTimepos
+      change.timepos <= currentEditorTimepos
         ? change.speedChange
         : activeSpeed
     ), 1);
   const currentEditorDistanceState = sortedSpeedChanges.reduce((distanceState, change) => {
-    const changeTimepos = change.measure + change.beat / 4;
+    const changeTimepos = change.timepos;
 
     if (changeTimepos > currentEditorTimepos) {
       return distanceState;
@@ -2536,7 +2542,7 @@ export default function Editor({
     recordOperation({
       category: 'timing',
       title: 'Modified BPM change',
-      detail: `${formatTimingPosition(previousChange.measure, previousChange.beat)} | ${changedFields.map(([key, value]) => `${key}: ${previousChange[key as keyof BpmChange]} -> ${value}`).join('; ')}`,
+      detail: `${formatTimingPosition(getBpmChangeTimepos(previousChange))} | ${changedFields.map(([key, value]) => `${key}: ${previousChange[key as keyof BpmChange]} -> ${value}`).join('; ')}`,
     });
   };
 
@@ -2548,30 +2554,26 @@ export default function Editor({
     recordOperation({
       category: 'timing',
       title: 'Deleted BPM change',
-      detail: `${formatTimingPosition(deletedChange.measure, deletedChange.beat)} | BPM ${formatHistoryNumber(deletedChange.bpm)} | ${deletedChange.timeSignature}`,
+      detail: `${formatTimingPosition(getBpmChangeTimepos(deletedChange))} | BPM ${formatHistoryNumber(deletedChange.bpm)} | ${deletedChange.timeSignature}`,
     });
   };
 
   const addBpmChange = () => {
-    const sortedChanges = [...bpmChanges].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
+    const sortedChanges = [...bpmChanges].sort((a, b) => getBpmChangeTimepos(a) - getBpmChangeTimepos(b));
     const lastChange = sortedChanges[sortedChanges.length - 1];
-    const totalBeats = getBeatAtTime(currentTime, convertBpmChangesToTime(bpmChanges));
-    const activeChange = getActiveChange(currentTime, convertBpmChangesToTime(bpmChanges));
-    const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
-    const measure = Math.floor(totalBeats / beatsPerMeasure);
-    const beat = Math.floor(totalBeats % beatsPerMeasure);
+    const timepos = Number(getTimeposFromTime(currentTime).toFixed(6));
     const newChange = {
-      measure,
-      beat,
+      timepos,
       bpm: lastChange ? lastChange.bpm : 120,
       timeSignature: lastChange ? lastChange.timeSignature : '4/4',
     };
 
     setBpmChanges([...bpmChanges, newChange]);
+    renderPausedTimelineAtFullFps();
     recordOperation({
       category: 'timing',
       title: 'Added BPM change',
-      detail: `${formatTimingPosition(newChange.measure, newChange.beat)} | BPM ${formatHistoryNumber(newChange.bpm)} | ${newChange.timeSignature}`,
+      detail: `${formatTimingPosition(newChange.timepos)} | BPM ${formatHistoryNumber(newChange.bpm)} | ${newChange.timeSignature}`,
     });
   };
 
@@ -2593,7 +2595,7 @@ export default function Editor({
     recordOperation({
       category: 'speed',
       title: 'Modified speed change',
-      detail: `${formatTimingPosition(previousChange.measure, previousChange.beat)} | ${changedFields.map(([key, value]) => `${key}: ${previousChange[key as keyof SpeedChange]} -> ${value}`).join('; ')}`,
+      detail: `${formatTimingPosition(previousChange.timepos)} | ${changedFields.map(([key, value]) => `${key}: ${previousChange[key as keyof SpeedChange]} -> ${value}`).join('; ')}`,
     });
   };
 
@@ -2605,25 +2607,22 @@ export default function Editor({
     recordOperation({
       category: 'speed',
       title: 'Deleted speed change',
-      detail: `${formatTimingPosition(deletedChange.measure, deletedChange.beat)} | ${formatHistoryNumber(deletedChange.speedChange)}x`,
+      detail: `${formatTimingPosition(deletedChange.timepos)} | ${formatHistoryNumber(deletedChange.speedChange)}x`,
     });
   };
 
   const addSpeedChange = () => {
-    const totalBeats = getBeatAtTime(currentTime, convertBpmChangesToTime(bpmChanges));
-    const activeChange = getActiveChange(currentTime, convertBpmChangesToTime(bpmChanges));
-    const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
     const newChange = {
-      measure: Math.floor(totalBeats / beatsPerMeasure),
-      beat: Math.floor(totalBeats % beatsPerMeasure),
+      timepos: Number(getTimeposFromTime(currentTime).toFixed(6)),
       speedChange: 1,
     };
 
     setSpeedChanges([...speedChanges, newChange]);
+    renderPausedTimelineAtFullFps();
     recordOperation({
       category: 'speed',
       title: 'Added speed change',
-      detail: `${formatTimingPosition(newChange.measure, newChange.beat)} | ${formatHistoryNumber(newChange.speedChange)}x`,
+      detail: `${formatTimingPosition(newChange.timepos)} | ${formatHistoryNumber(newChange.speedChange)}x`,
     });
   };
 
@@ -3427,9 +3426,8 @@ export default function Editor({
                     Export currently only supports BPM changes with 4/4 time signatures.
                   </p>
                   <label className="block shrink-0 text-xs text-neutral-400 mb-1">BPM Changes</label>
-                  <div className="grid grid-cols-[2.5rem_2.5rem_3rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
-                    <div>Meas</div>
-                    <div>Beat</div>
+                  <div className="grid grid-cols-[4.25rem_3rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
+                    <div>Timepos</div>
                     <div>BPM</div>
                     <div>Sig</div>
                     <div />
@@ -3440,12 +3438,10 @@ export default function Editor({
                     getKey={(_, index) => index}
                     className="min-h-0 flex-1 pr-1 text-sm text-neutral-300"
                     renderRow={(change, index, style) => (
-                      <div style={style} className="grid grid-cols-[2.5rem_2.5rem_3rem_3rem_1.5rem] items-center gap-1">
-                        <CommitInput type="number" value={change.measure} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
-                            updateBpmChange(index, { measure: parseInt(value) || 0 });
-                          }} />
-                        <CommitInput type="number" value={change.beat} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
-                            updateBpmChange(index, { beat: parseInt(value) || 0 });
+                      <div style={style} className="grid grid-cols-[4.25rem_3rem_3rem_1.5rem] items-center gap-1">
+                        <CommitInput type="number" step="0.001" value={getBpmChangeTimepos(change)} className="w-16 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                            const timepos = parseFloat(value);
+                            updateBpmChange(index, { timepos: Number.isFinite(timepos) ? timepos : 0 });
                           }} />
                         <CommitInput type="number" value={change.bpm} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
                             updateBpmChange(index, { bpm: parseFloat(value) || 120 });
@@ -3480,9 +3476,8 @@ export default function Editor({
                 <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Speed Changes</div>
               </div>
               <div className="flex flex-col overflow-hidden flex-1 pr-1 pb-4 min-h-0">
-                <div className="grid grid-cols-[2.5rem_2.5rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
-                  <div>Meas</div>
-                  <div>Beat</div>
+                <div className="grid grid-cols-[4.25rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
+                  <div>Timepos</div>
                   <div>Speed</div>
                   <div />
                 </div>
@@ -3492,12 +3487,10 @@ export default function Editor({
                   getKey={(_, index) => index}
                   className="min-h-0 flex-1 pr-1 text-sm text-neutral-300"
                   renderRow={(change, index, style) => (
-                    <div style={style} className="grid grid-cols-[2.5rem_2.5rem_3rem_1.5rem] items-center gap-1">
-                      <CommitInput type="number" value={change.measure} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
-                          updateSpeedChange(index, { measure: parseInt(value) || 0 });
-                        }} />
-                      <CommitInput type="number" value={change.beat} className="w-10 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
-                          updateSpeedChange(index, { beat: parseInt(value) || 0 });
+                    <div style={style} className="grid grid-cols-[4.25rem_3rem_1.5rem] items-center gap-1">
+                      <CommitInput type="number" step="0.001" value={change.timepos} className="w-16 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                          const timepos = parseFloat(value);
+                          updateSpeedChange(index, { timepos: Number.isFinite(timepos) ? timepos : 0 });
                         }} />
                       <CommitInput type="number" step="0.1" value={change.speedChange} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
                           const val = parseFloat(value);
