@@ -7,7 +7,7 @@ import EditorCanvas from './components/EditorCanvas';
 import CommitInput from './components/CommitInput';
 import VirtualizedChangeList from './components/VirtualizedChangeList';
 import { NOTE_TYPES, AVAILABLE_NOTE_TYPES, HOLD_CONNECTOR_TYPES, HOLD_CENTER_TYPES, HOLD_END_TYPES, HOLD_START_TYPES, UNKNOWN_NOTE_TYPE, canTypeHaveParent, getConnectorFill, shouldOmitParentForType } from './constants/editorConstants';
-import type { BpmChange, EditorFormData, EditorMode, Note, ProjectData, SelectionBox, SpeedChange } from './types/editorTypes';
+import type { BpmChange, EditorFormData, EditorMode, Note, ProjectData, SelectionBox, SpeedChange, TimedBpmChange } from './types/editorTypes';
 import { createExportZipInWorker, warmExportWorker } from './utils/exportWorkerClient';
 import { applyAudioPlaybackSpeed } from './editor/audioPlayback';
 import { EDITOR_KEYBIND_GROUPS } from './editor/editorKeybinds';
@@ -50,6 +50,47 @@ const AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS = 0.05;
 const AUDIO_SEEK_TIMEOUT_MS = 10000;
 const PLAYBACK_SPEED_OPTIONS = [1, 0.75, 0.5, 0.25, 1.25, 1.5, 1.75, 2] as const;
 const SIDE_PANEL_TRANSITION_MS = 300;
+const LANE_COUNT = 8;
+const SNAP_EPSILON = 0.000001;
+
+const getBeatsPerMeasureAtBeat = (beat: number, timedBpmChanges: TimedBpmChange[]) => {
+  const timeAtBeat = getTimeAtBeat(Math.max(0, beat), timedBpmChanges);
+  const activeChange = getActiveChange(timeAtBeat + 0.001, timedBpmChanges);
+  return parseInt(activeChange.timeSignature.split('/')[0], 10) || 4;
+};
+
+const getMeasureSpanAtBeat = (beat: number, timedBpmChanges: TimedBpmChange[]) => {
+  let measureStartBeat = 0;
+  let beatsPerMeasure = getBeatsPerMeasureAtBeat(measureStartBeat, timedBpmChanges);
+  let measureEndBeat = measureStartBeat + beatsPerMeasure;
+  let guard = 0;
+
+  while (beat >= measureEndBeat - SNAP_EPSILON && guard < 10000) {
+    measureStartBeat = measureEndBeat;
+    beatsPerMeasure = getBeatsPerMeasureAtBeat(measureStartBeat, timedBpmChanges);
+    measureEndBeat = measureStartBeat + beatsPerMeasure;
+    guard += 1;
+  }
+
+  return { measureStartBeat, measureEndBeat, beatsPerMeasure };
+};
+
+const snapBeatToMeasureDivision = (
+  beat: number,
+  divisionsPerMeasure: number,
+  timedBpmChanges: TimedBpmChange[],
+) => {
+  const { measureStartBeat, measureEndBeat, beatsPerMeasure } = getMeasureSpanAtBeat(beat, timedBpmChanges);
+
+  if (divisionsPerMeasure <= 0) {
+    return Math.abs(beat - measureStartBeat) <= Math.abs(measureEndBeat - beat)
+      ? measureStartBeat
+      : measureEndBeat;
+  }
+
+  const step = beatsPerMeasure / divisionsPerMeasure;
+  return measureStartBeat + Math.round((beat - measureStartBeat) / step) * step;
+};
 
 interface EditorProps {
   onBack: () => void;
@@ -94,6 +135,10 @@ interface PendingDragUpdate {
   noteId: number;
   lane: number;
   time: number;
+}
+
+interface CopiedNote extends Note {
+  copiedTimepos: number;
 }
 
 const APPEAR_MODE_OPTIONS = ['none', 'L', 'R', 'H', 'P'] as const;
@@ -263,6 +308,8 @@ export default function Editor({
   const isDraggingProgress = useRef(false);
   const pendingDragUpdateRef = useRef<PendingDragUpdate | null>(null);
   const dragStartNoteRef = useRef<Note | null>(null);
+  const copiedNotesRef = useRef<CopiedNote[]>([]);
+  const pasteTargetRef = useRef<HoverPreview | null>(null);
   const dragUpdateFrameRef = useRef<number>();
   const hoverPreviewRef = useRef<HoverPreview | null>(null);
   const playRequestIdRef = useRef(0);
@@ -427,6 +474,12 @@ export default function Editor({
     () => bpmChanges.some(change => change.timeSignature.trim() !== '4/4'),
     [bpmChanges],
   );
+  const hasRequiredExportMetadata = Boolean(
+    projectData?.songId.trim() &&
+    projectData?.difficulty.trim() &&
+    projectData?.songFile,
+  );
+  const isExportDisabled = hasExportIncompatibleTimeSignature || !hasRequiredExportMetadata;
   const selectedNoteIdSet = useMemo(() => new Set(selectedNoteIds), [selectedNoteIds]);
 
   const recordOperation = useCallback((entry: Omit<OperationHistoryEntry, 'id' | 'timestamp'>) => {
@@ -441,6 +494,48 @@ export default function Editor({
 
   const getNoteHistoryDetail = useCallback((note: Note) => {
     return `${formatNoteName(note)} #${note.id} at ${formatTime(note.time, timedBpmChanges)}, lane ${formatNoteLane(note.lane)}, width ${formatHistoryNumber(note.width)}`;
+  }, [timedBpmChanges]);
+
+  const getTimeposFromTime = useCallback((time: number) => {
+    const totalBeats = getBeatAtTime(time, timedBpmChanges);
+    let currentMeasureBeat = 0;
+    let measureCount = 0;
+    let currentBeatsPerMeasure = 4;
+
+    while (measureCount < 10000) {
+      const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, timedBpmChanges);
+      const activeChange = getActiveChange(timeAtMeasure + 0.001, timedBpmChanges);
+      currentBeatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0], 10) || 4;
+
+      if (totalBeats < currentMeasureBeat + currentBeatsPerMeasure) {
+        break;
+      }
+
+      currentMeasureBeat += currentBeatsPerMeasure;
+      measureCount++;
+    }
+
+    const beatInMeasure = totalBeats - currentMeasureBeat;
+    return measureCount + beatInMeasure / currentBeatsPerMeasure;
+  }, [timedBpmChanges]);
+
+  const getTimeFromTimepos = useCallback((timepos: number) => {
+    const measureCount = Math.max(0, Math.floor(timepos));
+    const measureDecimal = Math.max(0, timepos - measureCount);
+    let currentMeasureBeat = 0;
+    let currentBeatsPerMeasure = 4;
+
+    for (let measure = 0; measure <= measureCount; measure++) {
+      const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, timedBpmChanges);
+      const activeChange = getActiveChange(timeAtMeasure + 0.001, timedBpmChanges);
+      currentBeatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0], 10) || 4;
+
+      if (measure < measureCount) {
+        currentMeasureBeat += currentBeatsPerMeasure;
+      }
+    }
+
+    return getTimeAtBeat(currentMeasureBeat + measureDecimal * currentBeatsPerMeasure, timedBpmChanges);
   }, [timedBpmChanges]);
 
   const noteRenderIndex = useMemo(
@@ -679,7 +774,7 @@ export default function Editor({
     // Snap to grid
     const sortedChanges = timedBpmChanges;
     const targetBeat = getBeatAtTime(targetTime, sortedChanges);
-    const snappedBeat = Math.round(targetBeat * gridZoom) / gridZoom;
+    const snappedBeat = snapBeatToMeasureDivision(targetBeat, gridZoom, sortedChanges);
     const newTime = getTimeAtBeat(snappedBeat, sortedChanges);
     
     setCurrentTime(newTime);
@@ -698,7 +793,7 @@ export default function Editor({
       timeDisplayRef.current.textContent = formatTime(newTime, sortedChanges);
     }
     renderPausedTimelineAtFullFps();
-  }, [projectData, offset, gridZoom, renderPausedTimelineAtFullFps]);
+  }, [projectData, offset, gridZoom, renderPausedTimelineAtFullFps, timedBpmChanges]);
 
   const stopHitsounds = () => {
     activeHitSounds.current.forEach(source => {
@@ -979,6 +1074,85 @@ export default function Editor({
         setIsShiftHeld(true);
       }
 
+      if (!e.ctrlKey && !e.altKey && !e.metaKey && e.shiftKey && e.key.toLowerCase() === 'w') {
+        setGridZoom(prev => prev + 1);
+        return;
+      }
+
+      if (!e.ctrlKey && !e.altKey && !e.metaKey && e.shiftKey && e.key.toLowerCase() === 's') {
+        setGridZoom(prev => Math.max(0, prev - 1));
+        return;
+      }
+
+      if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === 'c') {
+        e.preventDefault();
+        if (e.repeat) return;
+
+        const selectedIdSet = new Set(selectedNoteIds);
+        copiedNotesRef.current = stateRef.current.notes
+          .filter(note => selectedIdSet.has(note.id))
+          .sort((a, b) => (a.time - b.time) || (a.id - b.id))
+          .map(note => ({
+            ...note,
+            copiedTimepos: getTimeposFromTime(note.time),
+          }));
+        return;
+      }
+
+      if (e.ctrlKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === 'v') {
+        e.preventDefault();
+        if (e.repeat) return;
+
+        const shouldMirrorPaste = e.shiftKey;
+        const copiedNotes = copiedNotesRef.current;
+        const pasteTarget = pasteTargetRef.current;
+        if (copiedNotes.length === 0 || !pasteTarget) return;
+
+        const baseTimepos = Math.min(...copiedNotes.map(note => note.copiedTimepos));
+        const pasteTimepos = getTimeposFromTime(pasteTarget.time);
+        const idMap = new Map<number, number>();
+
+        copiedNotes.forEach(note => {
+          idMap.set(note.id, nextNoteIdRef.current++);
+        });
+
+        const pastedNotes: Note[] = copiedNotes.map(({ copiedTimepos, ...note }) => {
+          const nextId = idMap.get(note.id) ?? nextNoteIdRef.current++;
+          const nextParentId = note.parentId !== null && idMap.has(note.parentId)
+            ? idMap.get(note.parentId) ?? null
+            : note.parentId;
+
+          return {
+            ...note,
+            id: nextId,
+            time: getTimeFromTimepos(pasteTimepos + copiedTimepos - baseTimepos),
+            lane: shouldMirrorPaste
+              ? Math.max(0, Math.min(LANE_COUNT - note.width / 2, LANE_COUNT - note.lane - note.width / 2))
+              : note.lane,
+            parentId: nextParentId,
+          };
+        });
+
+        setNotes(prev => [...prev, ...pastedNotes]);
+        setSelectedNoteIds(pastedNotes.map(note => note.id));
+        setDraggingNoteId(null);
+        setSelectionBox(null);
+        setHoverPreview(null);
+        pendingDragUpdateRef.current = null;
+        dragStartNoteRef.current = null;
+
+        recordOperation({
+          category: 'note',
+          title: pastedNotes.length === 1
+            ? shouldMirrorPaste ? 'Mirrored and pasted note' : 'Pasted note'
+            : shouldMirrorPaste ? `Mirrored and pasted ${pastedNotes.length} notes` : `Pasted ${pastedNotes.length} notes`,
+          detail: pastedNotes.length === 1
+            ? getNoteHistoryDetail(pastedNotes[0])
+            : `IDs ${formatGroupedIds(pastedNotes.map(note => note.id))} at ${formatTime(pasteTarget.time, timedBpmChanges)}`,
+        });
+        return;
+      }
+
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
         const noteIdsToDelete = new Set(selectedNoteIds);
@@ -1010,17 +1184,11 @@ export default function Editor({
       }
       
       if (e.key.toLowerCase() === 'w') {
-        setGridZoom(prev => {
-          if (prev < 4) return 4;
-          return prev + 4;
-        });
+        setGridZoom(prev => prev + 4);
       }
       
       if (e.key.toLowerCase() === 's') {
-        setGridZoom(prev => {
-          if (prev <= 4) return 1;
-          return prev - 4;
-        });
+        setGridZoom(prev => Math.max(0, prev - 4));
       }
 
       if (e.key.toLowerCase() === 'r') {
@@ -1079,7 +1247,7 @@ export default function Editor({
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleWindowBlur);
     };
-  }, [getNoteHistoryDetail, recordOperation, selectedNoteIds, togglePlay]);
+  }, [getNoteHistoryDetail, getTimeFromTimepos, getTimeposFromTime, recordOperation, selectedNoteIds, timedBpmChanges, togglePlay]);
 
   const drawGrid = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1222,7 +1390,7 @@ export default function Editor({
     const currentBeat = getBeatAtTime(time, sortedChanges);
     const hitLineY = height - 150;
 
-    const lanes = 8;
+    const lanes = LANE_COUNT;
     const laneWidth = Math.min(60, width / (lanes + 2));
     const gridWidth = lanes * laneWidth;
     const startX = (width - gridWidth) / 2;
@@ -1277,58 +1445,71 @@ export default function Editor({
       }
     }
 
-    // Pre-calculate measure boundaries
-    const measureBoundaries = new Set<number>();
-    const measureNumbers = new Map<number, number>();
+    const gridLines: Array<{
+      beat: number;
+      isMeasureLine: boolean;
+      measureNumber: number | null;
+    }> = [];
     let currentMeasureBeat = 0;
     let measureCount = 0;
     
     while (currentMeasureBeat <= endBeat) {
-      measureBoundaries.add(currentMeasureBeat);
-      measureNumbers.set(currentMeasureBeat, measureCount);
+      const beatsPerMeasure = getBeatsPerMeasureAtBeat(currentMeasureBeat, sortedChanges);
+      const nextMeasureBeat = currentMeasureBeat + beatsPerMeasure;
+
+      if (currentMeasureBeat >= startBeat) {
+        gridLines.push({
+          beat: currentMeasureBeat,
+          isMeasureLine: true,
+          measureNumber: measureCount,
+        });
+      }
+
+      if (gridZoom > 0) {
+        const step = beatsPerMeasure / gridZoom;
+
+        for (let division = 1; division < gridZoom; division += 1) {
+          const divisionBeat = currentMeasureBeat + division * step;
+          if (divisionBeat < startBeat || divisionBeat > endBeat) continue;
+
+          gridLines.push({
+            beat: divisionBeat,
+            isMeasureLine: false,
+            measureNumber: null,
+          });
+        }
+      }
       
-      const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, sortedChanges);
-      const activeChange = getActiveChange(timeAtMeasure + 0.001, sortedChanges);
-      const beatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0]) || 4;
-      
-      currentMeasureBeat += beatsPerMeasure;
+      currentMeasureBeat = nextMeasureBeat;
       measureCount++;
     }
 
-    // Draw beats and subdivisions
-    const subdivisions = gridZoom;
-    const step = 1 / subdivisions;
-    
-    for (let b = startBeat; b <= endBeat; b += step) {
-      if (b < 0) continue;
-      const y = hitLineY - (b - currentBeat) * pixelsPerBeat;
-      
-      const isBeatLine = Math.abs(Math.round(b) - b) < 0.001;
-      const isMeasureLine = isBeatLine && measureBoundaries.has(Math.round(b));
+    gridLines.sort((a, b) => a.beat - b.beat);
+
+    for (const gridLine of gridLines) {
+      if (gridLine.beat < 0) continue;
+      const y = hitLineY - (gridLine.beat - currentBeat) * pixelsPerBeat;
 
       ctx.beginPath();
       ctx.moveTo(startX, y);
       ctx.lineTo(startX + gridWidth, y);
-      
-      if (isMeasureLine) {
+
+      if (gridLine.isMeasureLine) {
         ctx.strokeStyle = '#666';
         ctx.lineWidth = 2;
-      } else if (isBeatLine) {
-        ctx.strokeStyle = '#444';
-        ctx.lineWidth = 1;
       } else {
-        ctx.strokeStyle = '#222';
-        ctx.lineWidth = 0.5;
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
       }
       ctx.stroke();
       objectCount += 1;
       
-      if (isMeasureLine) {
+      if (gridLine.isMeasureLine) {
         ctx.fillStyle = '#888';
         ctx.font = '12px Inter, sans-serif';
         ctx.textAlign = 'right';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`${measureNumbers.get(Math.round(b))}`, startX - 10, y);
+        ctx.fillText(`${gridLine.measureNumber}`, startX - 10, y);
         objectCount += 1;
       }
     }
@@ -1832,7 +2013,7 @@ export default function Editor({
     const clickY = e.clientY - rect.top;
 
     const { width, height } = canvas;
-    const lanes = 8;
+    const lanes = LANE_COUNT;
     const laneWidth = Math.min(60, width / (lanes + 2));
     const gridWidth = lanes * laneWidth;
     const startX = (width - gridWidth) / 2;
@@ -1845,12 +2026,18 @@ export default function Editor({
     const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
     
     // Snap to grid
-    const snap = gridZoom;
-    const snappedBeat = Math.round(clickBeat * snap) / snap;
+    const snappedBeat = snapBeatToMeasureDivision(clickBeat, gridZoom, sortedChanges);
     
     if (snappedBeat < 0) return;
     
     const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
+
+    if (clickX >= startX && clickX < startX + gridWidth) {
+      pasteTargetRef.current = {
+        lane: getLaneFromCanvasX(clickX, startX, laneWidth, lanes),
+        time: snappedTime,
+      };
+    }
 
     const noteHitPaddingBeats = 10 / pixelsPerBeat;
     const hitNotes = getNoteBeatEntriesInRange(
@@ -1978,7 +2165,7 @@ export default function Editor({
     const clickY = e.clientY - rect.top;
 
     const { width, height } = canvas;
-    const lanes = 8;
+    const lanes = LANE_COUNT;
     const laneWidth = Math.min(60, width / (lanes + 2));
     const gridWidth = lanes * laneWidth;
     const startX = (width - gridWidth) / 2;
@@ -1986,12 +2173,23 @@ export default function Editor({
     const sortedChanges = timedBpmChanges;
     const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
 
+    if (clickX >= startX && clickX < startX + gridWidth) {
+      const lane = getLaneFromCanvasX(clickX, startX, laneWidth, lanes);
+      const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
+      const snappedBeat = snapBeatToMeasureDivision(clickBeat, gridZoom, sortedChanges);
+
+      pasteTargetRef.current = snappedBeat >= 0
+        ? { lane, time: getTimeAtBeat(snappedBeat, sortedChanges) }
+        : null;
+    } else {
+      pasteTargetRef.current = null;
+    }
+
     if (draggingNoteId) {
       const lane = getLaneFromCanvasX(clickX, startX, laneWidth, lanes);
       const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
       
-      const snap = gridZoom;
-      const snappedBeat = Math.round(clickBeat * snap) / snap;
+      const snappedBeat = snapBeatToMeasureDivision(clickBeat, gridZoom, sortedChanges);
       
       if (snappedBeat < 0) return;
       
@@ -2015,7 +2213,7 @@ export default function Editor({
       const lane = getLaneFromCanvasX(clickX, startX, laneWidth, lanes);
 
       const clickBeat = currentBeat + (hitLineY - clickY) / pixelsPerBeat;
-      const snappedBeat = Math.round(clickBeat * gridZoom) / gridZoom;
+      const snappedBeat = snapBeatToMeasureDivision(clickBeat, gridZoom, sortedChanges);
 
       if (snappedBeat < 0) {
         if (hoverPreviewRef.current !== null) {
@@ -2044,7 +2242,7 @@ export default function Editor({
       const canvas = canvasRef.current;
       if (canvas) {
         const { width, height } = canvas;
-        const lanes = 8;
+        const lanes = LANE_COUNT;
         const laneWidth = Math.min(60, width / (lanes + 2));
         const gridWidth = lanes * laneWidth;
         const startX = (width - gridWidth) / 2;
@@ -2100,7 +2298,7 @@ export default function Editor({
     const targetBeat = currentBeat + (scrollDelta / pixelsPerBeat);
     
     // Snap to grid
-    const snappedBeat = Math.round(targetBeat * gridZoom) / gridZoom;
+    const snappedBeat = snapBeatToMeasureDivision(targetBeat, gridZoom, sortedChanges);
     const newTime = getTimeAtBeat(snappedBeat, sortedChanges);
     
     let clampedTime = Math.max(0, newTime);
@@ -2164,7 +2362,7 @@ export default function Editor({
   };
 
   const exportDr3Viewer = async () => {
-    if (!projectData || !projectData.songFile || hasExportIncompatibleTimeSignature) return;
+    if (!projectData || isExportDisabled) return;
 
     try {
       const { zipBuffer, suggestedName } = await createExportZipInWorker({
@@ -2182,7 +2380,7 @@ export default function Editor({
   };
 
   const exportDr3Fp = async () => {
-    if (!projectData || !projectData.songFile || hasExportIncompatibleTimeSignature) return;
+    if (!projectData || isExportDisabled) return;
 
     try {
       const { zipBuffer, suggestedName } = await createExportZipInWorker({
@@ -2216,46 +2414,6 @@ export default function Editor({
       ? null
       : notes.find((note) => note.id === selectedSingleNote.parentId) || null;
   const canEditSelectedNoteParent = selectedSingleNote ? canTypeHaveParent(selectedSingleNote.type) : false;
-  const getTimeposFromTime = (time: number) => {
-    const totalBeats = getBeatAtTime(time, timedBpmChanges);
-    let currentMeasureBeat = 0;
-    let measureCount = 0;
-    let currentBeatsPerMeasure = 4;
-
-    while (measureCount < 10000) {
-      const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, timedBpmChanges);
-      const activeChange = getActiveChange(timeAtMeasure + 0.001, timedBpmChanges);
-      currentBeatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0], 10) || 4;
-
-      if (totalBeats < currentMeasureBeat + currentBeatsPerMeasure) {
-        break;
-      }
-
-      currentMeasureBeat += currentBeatsPerMeasure;
-      measureCount++;
-    }
-
-    const beatInMeasure = totalBeats - currentMeasureBeat;
-    return measureCount + beatInMeasure / currentBeatsPerMeasure;
-  };
-  const getTimeFromTimepos = (timepos: number) => {
-    const measureCount = Math.max(0, Math.floor(timepos));
-    const measureDecimal = Math.max(0, timepos - measureCount);
-    let currentMeasureBeat = 0;
-    let currentBeatsPerMeasure = 4;
-
-    for (let measure = 0; measure <= measureCount; measure++) {
-      const timeAtMeasure = getTimeAtBeat(currentMeasureBeat, timedBpmChanges);
-      const activeChange = getActiveChange(timeAtMeasure + 0.001, timedBpmChanges);
-      currentBeatsPerMeasure = parseInt(activeChange.timeSignature.split('/')[0], 10) || 4;
-
-      if (measure < measureCount) {
-        currentMeasureBeat += currentBeatsPerMeasure;
-      }
-    }
-
-    return getTimeAtBeat(currentMeasureBeat + measureDecimal * currentBeatsPerMeasure, timedBpmChanges);
-  };
   const selectedNoteTimepos = selectedSingleNote ? getTimeposFromTime(selectedSingleNote.time) : 0;
   const currentEditorTimepos = getTimeposFromTime(liveStatsTime);
   const currentEditorBpm = getActiveChange(liveStatsTime, timedBpmChanges).bpm;
@@ -2529,8 +2687,8 @@ export default function Editor({
           setIsModalOpen(false);
         }}
         onConfirm={() => {
-          if (!formData.songId || !formData.songFile || !formData.songBpm) {
-            alert('Please fill in all required fields: Song ID, Audio File, and Song BPM.');
+          if (!formData.songId.trim() || !formData.difficulty.trim() || !formData.songFile || !formData.songBpm) {
+            alert('Please fill in all required fields: Song ID, Difficulty, Audio File, and Song BPM.');
             return;
           }
           handleConfirm();
@@ -2941,7 +3099,7 @@ export default function Editor({
           {projectData && (
             <>
               <div className="text-sm font-mono text-neutral-400 w-20 text-left">
-                Snap <span className="inline-block w-8 text-center">1/{gridZoom}</span>
+                Snap <span className="inline-block w-8 text-center">{gridZoom === 0 ? '0' : `1/${gridZoom}`}</span>
               </div>
               <div className="text-sm font-mono text-neutral-400 w-24 text-left">
                 Zoom <span className="inline-block w-10 text-center">{pixelsPerBeat}px</span>
@@ -3015,9 +3173,10 @@ export default function Editor({
           <div className="relative ml-2">
             <button
               type="button"
+              disabled={isExportDisabled}
               onClick={() => setIsExportMenuOpen(current => !current)}
-              className="flex items-center gap-2 px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg transition-colors text-sm font-medium"
-              title="Export Level"
+              className="flex items-center gap-2 px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg transition-colors text-sm font-medium disabled:cursor-not-allowed disabled:bg-neutral-800 disabled:text-neutral-500"
+              title={isExportDisabled ? 'Song ID, difficulty, and audio are required before export.' : 'Export Level'}
               aria-haspopup="menu"
               aria-expanded={isExportMenuOpen}
             >
@@ -3036,7 +3195,7 @@ export default function Editor({
                 )}
                 <button
                   type="button"
-                  disabled={hasExportIncompatibleTimeSignature || !projectData?.songFile}
+                  disabled={isExportDisabled}
                   onClick={() => {
                     setIsExportMenuOpen(false);
                     void exportDr3Viewer();
@@ -3048,7 +3207,7 @@ export default function Editor({
                 </button>
                 <button
                   type="button"
-                  disabled={hasExportIncompatibleTimeSignature || !projectData?.songFile}
+                  disabled={isExportDisabled}
                   onClick={() => {
                     setIsExportMenuOpen(false);
                     void exportDr3Fp();
@@ -3185,8 +3344,8 @@ export default function Editor({
               </div>
               <div className="flex flex-col gap-3 overflow-y-auto flex-1 pr-1 pb-4">
                 <div>
-                  <label className="block text-xs text-neutral-400 mb-1">Song ID</label>
-                  <input type="text" value={formData.songId} className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => setFormData({...formData, songId: e.target.value})} />
+                  <label className="block text-xs text-neutral-400 mb-1">Song ID *</label>
+                  <input type="text" value={formData.songId} required className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => setFormData({...formData, songId: e.target.value})} />
                 </div>
                 <div>
                   <label className="block text-xs text-neutral-400 mb-1">Song Name</label>
@@ -3197,16 +3356,16 @@ export default function Editor({
                   <input type="text" value={formData.songArtist} className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => setFormData({...formData, songArtist: e.target.value})} />
                 </div>
                 <div>
-                  <label className="block text-xs text-neutral-400 mb-1">Difficulty</label>
-                  <input type="number" value={formData.difficulty} className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => setFormData({...formData, difficulty: e.target.value})} />
+                  <label className="block text-xs text-neutral-400 mb-1">Difficulty *</label>
+                  <input type="number" value={formData.difficulty} required className="w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none" onChange={(e) => setFormData({...formData, difficulty: e.target.value})} />
                 </div>
                 <div>
-                  <label className="block text-xs text-neutral-400 mb-1">Audio File</label>
+                  <label className="block text-xs text-neutral-400 mb-1">Audio File *</label>
                   <label className="flex flex-col items-center justify-center w-full h-12 border-2 border-dashed border-neutral-700 rounded cursor-pointer hover:border-indigo-500 hover:bg-neutral-800/50 transition-colors">
                     <p className="text-xs text-neutral-400 truncate w-full px-2 text-center">
                       {formData.songFile ? <span className="font-semibold text-indigo-400">{formData.songFile.name}</span> : <span>Upload audio</span>}
                     </p>
-                    <input type="file" accept="audio/*" className="hidden" onChange={(e) => setFormData({...formData, songFile: e.target.files?.[0] || null})} />
+                    <input type="file" accept="audio/*" required className="hidden" onChange={(e) => setFormData({...formData, songFile: e.target.files?.[0] || null})} />
                   </label>
                 </div>
                 <div>

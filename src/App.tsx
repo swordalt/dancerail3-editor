@@ -83,6 +83,9 @@ const hasDuplicateExtension = (files: { name: string }[]) => {
   return [...extensionCounts.values()].some(count => count > 1);
 };
 
+const getDefaultBpmChanges = (): BpmChange[] => DEFAULT_BPM_CHANGES.map(change => ({ ...change }));
+const getDefaultSpeedChanges = (): SpeedChange[] => DEFAULT_SPEED_CHANGES.map(change => ({ ...change }));
+
 export default function App() {
   const [view, setView] = useState<ViewState>({ page: 'landing' });
   const [notes, setNotes] = useState<Note[]>([]);
@@ -93,8 +96,16 @@ export default function App() {
   const [isExampleLoading, setIsExampleLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleImportClick = () => {
+  const resetEditorState = () => {
+    setNotes([]);
+    setBpmChanges(getDefaultBpmChanges());
+    setSpeedChanges(getDefaultSpeedChanges());
+    setOffset(0);
     setInitialProjectData(null);
+  };
+
+  const handleImportClick = () => {
+    resetEditorState();
     fileInputRef.current?.click();
   };
 
@@ -102,8 +113,8 @@ export default function App() {
     const parsedLevel = parseLevelText(text);
 
     setNotes(parsedLevel.notes);
-    setBpmChanges(parsedLevel.bpmChanges.length > 0 ? parsedLevel.bpmChanges : DEFAULT_BPM_CHANGES);
-    setSpeedChanges(parsedLevel.speedChanges.length > 0 ? parsedLevel.speedChanges : DEFAULT_SPEED_CHANGES);
+    setBpmChanges(parsedLevel.bpmChanges.length > 0 ? parsedLevel.bpmChanges : getDefaultBpmChanges());
+    setSpeedChanges(parsedLevel.speedChanges.length > 0 ? parsedLevel.speedChanges : getDefaultSpeedChanges());
     setOffset(parsedLevel.offset);
 
     return parsedLevel;
@@ -145,7 +156,7 @@ export default function App() {
 
       const chartText = await chartFile.entry.async('text');
       const parsedLevel = handleLevelImport(chartText);
-      const nextBpmChanges = parsedLevel.bpmChanges.length > 0 ? parsedLevel.bpmChanges : DEFAULT_BPM_CHANGES;
+      const nextBpmChanges = parsedLevel.bpmChanges.length > 0 ? parsedLevel.bpmChanges : getDefaultBpmChanges();
       const firstBpm = nextBpmChanges[0]?.bpm || 120;
       const zipBaseName = getZipBaseName(file.name);
       const chartBaseName = getFileBaseName(chartFile.name);
@@ -208,7 +219,7 @@ export default function App() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      setInitialProjectData(null);
+      resetEditorState();
       if (file.name.toLowerCase().endsWith('.zip')) {
         void handleZipImport(file);
       } else if (file.name.toLowerCase().endsWith('.txt')) {
@@ -261,8 +272,8 @@ export default function App() {
         .split(/\r?\n/)
         .map((line) => line.trim());
       const parsedLevel = parseLevelText(text);
-      const nextBpmChanges = parsedLevel.bpmChanges.length > 0 ? parsedLevel.bpmChanges : DEFAULT_BPM_CHANGES;
-      const nextSpeedChanges = parsedLevel.speedChanges.length > 0 ? parsedLevel.speedChanges : DEFAULT_SPEED_CHANGES;
+      const nextBpmChanges = parsedLevel.bpmChanges.length > 0 ? parsedLevel.bpmChanges : getDefaultBpmChanges();
+      const nextSpeedChanges = parsedLevel.speedChanges.length > 0 ? parsedLevel.speedChanges : getDefaultSpeedChanges();
       const exampleBpm = nextBpmChanges[0]?.bpm || 120;
       const exampleAudioFile = new File([audioBlob], example.audioFileName, { type: audioBlob.type || getMimeType(getFileExtension(example.audioFileName)) });
 
@@ -296,7 +307,7 @@ export default function App() {
         <LandingPage
           fileInputRef={fileInputRef}
           onCreateProject={() => {
-            setInitialProjectData(null);
+            resetEditorState();
             setView({ page: 'editor', mode: 'new' });
           }}
           onImportClick={handleImportClick}

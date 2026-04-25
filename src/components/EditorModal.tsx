@@ -43,24 +43,25 @@ export default function EditorModal({ isOpen, onClose, onConfirm, formData, setF
               </button>
             </div>
             <div className="space-y-4">
-              <input type="text" placeholder="Song ID" value={formData.songId} className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, songId: e.target.value})} />
+              <input type="text" placeholder="Song ID *" value={formData.songId} required className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, songId: e.target.value})} />
               <input type="text" placeholder="Song Name" value={formData.songName} className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, songName: e.target.value})} />
               <input type="text" placeholder="Song Artist" value={formData.songArtist} className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, songArtist: e.target.value})} />
-              <input type="number" placeholder="Song BPM" value={formData.songBpm} className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, songBpm: e.target.value})} />
-              <input type="number" placeholder="Difficulty" value={formData.difficulty} className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, difficulty: e.target.value})} />
+              <input type="number" placeholder="Song BPM *" value={formData.songBpm} required className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, songBpm: e.target.value})} />
+              <input type="number" placeholder="Difficulty *" value={formData.difficulty} required className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, difficulty: e.target.value})} />
               
               <div className="flex items-center gap-2">
                 <button 
                   onClick={handleUploadClick}
                   className="p-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg border border-neutral-700 transition-colors w-full text-left"
                 >
-                  {formData.songFile ? formData.songFile.name : 'Select Audio File'}
+                  {formData.songFile ? formData.songFile.name : 'Select Audio File *'}
                 </button>
                 <input 
                   type="file" 
                   ref={fileInputRef} 
                   onChange={handleFileChange} 
                   accept="audio/*" 
+                  required
                   className="hidden" 
                 />
               </div>

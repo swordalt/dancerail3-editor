@@ -9,8 +9,10 @@ export const EDITOR_KEYBIND_GROUPS = [
   {
     title: 'Grid and View',
     bindings: [
-      { keys: ['W'], description: 'Increase snap precision.' },
-      { keys: ['S'], description: 'Decrease snap precision.' },
+      { keys: ['W'], description: 'Increase measure snap divisions by 4.' },
+      { keys: ['S'], description: 'Decrease measure snap divisions by 4, down to 0.' },
+      { keys: ['Shift', 'W'], description: 'Increase measure snap divisions by 1.' },
+      { keys: ['Shift', 'S'], description: 'Decrease measure snap divisions by 1, down to 0.' },
       { keys: ['R'], description: 'Zoom the timeline in by increasing pixels per beat.' },
       { keys: ['F'], description: 'Zoom the timeline out by decreasing pixels per beat.' },
     ],
@@ -34,6 +36,9 @@ export const EDITOR_KEYBIND_GROUPS = [
       { keys: ['Ctrl', 'Left click note'], description: 'Toggle a note in or out of the current selection.' },
       { keys: ['Shift', 'Left click note'], description: 'Start moving the clicked note.' },
       { keys: ['Shift', 'Middle click note'], description: 'Start moving the clicked note.' },
+      { keys: ['Ctrl', 'C'], description: 'Copy all selected notes.' },
+      { keys: ['Ctrl', 'V'], description: 'Paste copied notes at the mouse time position.' },
+      { keys: ['Ctrl', 'Shift', 'V'], description: 'Mirror copied notes horizontally, then paste them at the mouse time position.' },
       { keys: ['Delete'], description: 'Delete all selected notes.' },
       { keys: ['Backspace'], description: 'Delete all selected notes.' },
     ],

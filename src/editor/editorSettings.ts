@@ -25,7 +25,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   musicVolume: 1,
   tapSoundVolume: 1,
   flickSoundVolume: 1,
-  gridZoom: 1,
+  gridZoom: 4,
   isXPositionGridEnabled: true,
   pixelsPerBeat: DEFAULT_PIXELS_PER_BEAT,
 };
@@ -41,7 +41,7 @@ const isValidVolume = (value: unknown): value is number => (
 const isValidGridZoom = (value: unknown): value is number => (
   typeof value === 'number' &&
   Number.isInteger(value) &&
-  (value === 1 || (value >= 4 && value % 4 === 0))
+  value >= 0
 );
 
 const isValidPixelsPerBeat = (value: unknown): value is number => (
