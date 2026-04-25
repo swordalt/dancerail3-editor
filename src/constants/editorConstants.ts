@@ -15,6 +15,9 @@ export const HOLD_START_TYPES = [3, 5, 10];
 export const HOLD_CENTER_TYPES = [6, 11, 17, 19, 21, 23];
 export const HOLD_END_TYPES = [4, 7, 18, 20, 22, 24];
 
+export const canTypeHaveParent = (type: number) => HOLD_CENTER_TYPES.includes(type) || HOLD_END_TYPES.includes(type);
+export const shouldOmitParentForType = (type: number) => !canTypeHaveParent(type);
+
 export const getConnectorFill = (noteType: number) => {
   const color = (NOTE_TYPES[noteType] || UNKNOWN_NOTE_TYPE).color;
   const alpha = [10, 17, 18].includes(noteType) ? '70' : '40';

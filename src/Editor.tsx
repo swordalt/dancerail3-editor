@@ -4,9 +4,36 @@ import { ArrowLeft, Settings, Play, Pause, Download, X, ChevronLeft, ChevronRigh
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from './utils/editorUtils';
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
-import { NOTE_TYPES, AVAILABLE_NOTE_TYPES, HOLD_CONNECTOR_TYPES, HOLD_CENTER_TYPES, HOLD_END_TYPES, HOLD_START_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from './constants/editorConstants';
+import CommitInput from './components/CommitInput';
+import VirtualizedChangeList from './components/VirtualizedChangeList';
+import { NOTE_TYPES, AVAILABLE_NOTE_TYPES, HOLD_CONNECTOR_TYPES, HOLD_CENTER_TYPES, HOLD_END_TYPES, HOLD_START_TYPES, UNKNOWN_NOTE_TYPE, canTypeHaveParent, getConnectorFill, shouldOmitParentForType } from './constants/editorConstants';
 import type { BpmChange, EditorFormData, EditorMode, Note, ProjectData, SelectionBox, SpeedChange } from './types/editorTypes';
 import { createExportZipInWorker, warmExportWorker } from './utils/exportWorkerClient';
+import { applyAudioPlaybackSpeed } from './editor/audioPlayback';
+import { EDITOR_KEYBIND_GROUPS } from './editor/editorKeybinds';
+import {
+  MAX_OPERATION_HISTORY_ENTRIES,
+  type OperationHistoryEntry,
+  formatGroupedIds,
+  formatHistoryNumber,
+  formatHistoryTimestamp,
+  formatMaybeValue,
+  formatNoteLane,
+  formatNoteName,
+  formatPlaybackSpeed,
+  formatTimingPosition,
+  operationCategoryStyles,
+} from './editor/editorHistory';
+import {
+  MAX_PIXELS_PER_BEAT,
+  MIN_PIXELS_PER_BEAT,
+  STATISTICS_REFRESH_RATE_OPTIONS,
+  type StatisticsRefreshRate,
+  getStatisticsRefreshIntervalMs,
+  loadEditorSettings,
+  saveEditorSettings,
+} from './editor/editorSettings';
+import { buildNoteRenderIndex, getNoteBeatEntriesInRange } from './editor/noteRenderIndex';
 
 const HIT_SOUND_URL = new URL('../hit.ogg', import.meta.url).href;
 const FLICK_SOUND_URL = new URL('../flick.ogg', import.meta.url).href;
@@ -22,173 +49,7 @@ const AUDIO_CLOCK_HANDOFF_DELAY_MS = 200;
 const AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS = 0.05;
 const AUDIO_SEEK_TIMEOUT_MS = 10000;
 const PLAYBACK_SPEED_OPTIONS = [1, 0.75, 0.5, 0.25, 1.25, 1.5, 1.75, 2] as const;
-const DEFAULT_PIXELS_PER_BEAT = 150;
-const MIN_PIXELS_PER_BEAT = 60;
-const MAX_PIXELS_PER_BEAT = 320;
-const EDITOR_SETTINGS_STORAGE_KEY = 'dancerail3-editor:settings';
 const SIDE_PANEL_TRANSITION_MS = 300;
-const STATISTICS_REFRESH_RATE_OPTIONS = ['15fps', '30fps', '60fps', 'max'] as const;
-type StatisticsRefreshRate = typeof STATISTICS_REFRESH_RATE_OPTIONS[number];
-
-interface EditorSettings {
-  isExitWarningEnabled: boolean;
-  isScrollDirectionInverted: boolean;
-  statisticsRefreshRate: StatisticsRefreshRate;
-  musicVolume: number;
-  tapSoundVolume: number;
-  flickSoundVolume: number;
-  gridZoom: number;
-  isXPositionGridEnabled: boolean;
-  pixelsPerBeat: number;
-}
-
-const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
-  isExitWarningEnabled: true,
-  isScrollDirectionInverted: false,
-  statisticsRefreshRate: '30fps',
-  musicVolume: 1,
-  tapSoundVolume: 1,
-  flickSoundVolume: 1,
-  gridZoom: 1,
-  isXPositionGridEnabled: true,
-  pixelsPerBeat: DEFAULT_PIXELS_PER_BEAT,
-};
-
-const EDITOR_KEYBIND_GROUPS = [
-  {
-    title: 'Playback and Navigation',
-    bindings: [
-      { keys: ['Space'], description: 'Play or pause the song from the current editor time.' },
-      { keys: ['Mouse wheel'], description: 'Move through the timeline. Scrolling stops playback before seeking.' },
-    ],
-  },
-  {
-    title: 'Grid and View',
-    bindings: [
-      { keys: ['W'], description: 'Increase snap precision.' },
-      { keys: ['S'], description: 'Decrease snap precision.' },
-      { keys: ['R'], description: 'Zoom the timeline in by increasing pixels per beat.' },
-      { keys: ['F'], description: 'Zoom the timeline out by decreasing pixels per beat.' },
-    ],
-  },
-  {
-    title: 'Note Tools',
-    bindings: [
-      { keys: ['A'], description: 'Select the previous note type.' },
-      { keys: ['D'], description: 'Select the next note type.' },
-      { keys: ['Q'], description: 'Decrease the placement note width.' },
-      { keys: ['E'], description: 'Increase the placement note width.' },
-    ],
-  },
-  {
-    title: 'Canvas Editing',
-    bindings: [
-      { keys: ['Left click'], description: 'Place the selected note type on the snapped grid position.' },
-      { keys: ['Right click'], description: 'Delete the clicked note, or delete the selected group when clicking a selected note.' },
-      { keys: ['Middle click note'], description: 'Select the clicked note.' },
-      { keys: ['Middle drag empty space'], description: 'Draw a selection box.' },
-      { keys: ['Ctrl', 'Left click note'], description: 'Toggle a note in or out of the current selection.' },
-      { keys: ['Shift', 'Left click note'], description: 'Start moving the clicked note.' },
-      { keys: ['Shift', 'Middle click note'], description: 'Start moving the clicked note.' },
-      { keys: ['Delete'], description: 'Delete all selected notes.' },
-      { keys: ['Backspace'], description: 'Delete all selected notes.' },
-    ],
-  },
-  {
-    title: 'Fields',
-    bindings: [
-      { keys: ['Enter'], description: 'Commit the current input value and leave the field.' },
-    ],
-  },
-] as const;
-
-const isPlainRecord = (value: unknown): value is Record<string, unknown> => (
-  typeof value === 'object' && value !== null && !Array.isArray(value)
-);
-
-const isValidVolume = (value: unknown): value is number => (
-  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 2
-);
-
-const isValidGridZoom = (value: unknown): value is number => (
-  typeof value === 'number' &&
-  Number.isInteger(value) &&
-  (value === 1 || (value >= 4 && value % 4 === 0))
-);
-
-const isValidPixelsPerBeat = (value: unknown): value is number => (
-  typeof value === 'number' &&
-  Number.isInteger(value) &&
-  value >= MIN_PIXELS_PER_BEAT &&
-  value <= MAX_PIXELS_PER_BEAT
-);
-
-const isValidStatisticsRefreshRate = (value: unknown): value is StatisticsRefreshRate => (
-  typeof value === 'string' &&
-  STATISTICS_REFRESH_RATE_OPTIONS.includes(value as StatisticsRefreshRate)
-);
-
-const getStatisticsRefreshIntervalMs = (refreshRate: StatisticsRefreshRate) => {
-  if (refreshRate === 'max') {
-    return 0;
-  }
-
-  return 1000 / Number(refreshRate.replace('fps', ''));
-};
-
-const loadEditorSettings = (): EditorSettings => {
-  if (typeof window === 'undefined') return DEFAULT_EDITOR_SETTINGS;
-
-  try {
-    const storedSettings = window.localStorage.getItem(EDITOR_SETTINGS_STORAGE_KEY);
-    if (!storedSettings) return DEFAULT_EDITOR_SETTINGS;
-
-    const parsedSettings: unknown = JSON.parse(storedSettings);
-    if (!isPlainRecord(parsedSettings)) return DEFAULT_EDITOR_SETTINGS;
-
-    return {
-      isExitWarningEnabled: typeof parsedSettings.isExitWarningEnabled === 'boolean'
-        ? parsedSettings.isExitWarningEnabled
-        : DEFAULT_EDITOR_SETTINGS.isExitWarningEnabled,
-      isScrollDirectionInverted: typeof parsedSettings.isScrollDirectionInverted === 'boolean'
-        ? parsedSettings.isScrollDirectionInverted
-        : DEFAULT_EDITOR_SETTINGS.isScrollDirectionInverted,
-      statisticsRefreshRate: isValidStatisticsRefreshRate(parsedSettings.statisticsRefreshRate)
-        ? parsedSettings.statisticsRefreshRate
-        : DEFAULT_EDITOR_SETTINGS.statisticsRefreshRate,
-      musicVolume: isValidVolume(parsedSettings.musicVolume)
-        ? parsedSettings.musicVolume
-        : DEFAULT_EDITOR_SETTINGS.musicVolume,
-      tapSoundVolume: isValidVolume(parsedSettings.tapSoundVolume)
-        ? parsedSettings.tapSoundVolume
-        : DEFAULT_EDITOR_SETTINGS.tapSoundVolume,
-      flickSoundVolume: isValidVolume(parsedSettings.flickSoundVolume)
-        ? parsedSettings.flickSoundVolume
-        : DEFAULT_EDITOR_SETTINGS.flickSoundVolume,
-      gridZoom: isValidGridZoom(parsedSettings.gridZoom)
-        ? parsedSettings.gridZoom
-        : DEFAULT_EDITOR_SETTINGS.gridZoom,
-      isXPositionGridEnabled: typeof parsedSettings.isXPositionGridEnabled === 'boolean'
-        ? parsedSettings.isXPositionGridEnabled
-        : DEFAULT_EDITOR_SETTINGS.isXPositionGridEnabled,
-      pixelsPerBeat: isValidPixelsPerBeat(parsedSettings.pixelsPerBeat)
-        ? parsedSettings.pixelsPerBeat
-        : DEFAULT_EDITOR_SETTINGS.pixelsPerBeat,
-    };
-  } catch {
-    return DEFAULT_EDITOR_SETTINGS;
-  }
-};
-
-const saveEditorSettings = (settings: EditorSettings) => {
-  if (typeof window === 'undefined') return;
-
-  try {
-    window.localStorage.setItem(EDITOR_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    // Storage can be unavailable in private browsing or restricted iframe contexts.
-  }
-};
 
 interface EditorProps {
   onBack: () => void;
@@ -235,203 +96,7 @@ interface PendingDragUpdate {
   time: number;
 }
 
-type OperationCategory = 'note' | 'timing' | 'speed' | 'metadata';
-
-interface OperationHistoryEntry {
-  id: number;
-  timestamp: number;
-  category: OperationCategory;
-  title: string;
-  detail: string;
-}
-
-const MAX_OPERATION_HISTORY_ENTRIES = 500;
-
-const getNoteIdGroupKey = (note: Note, noteBeat: number) => {
-  const centerPosition = note.lane + note.width / 4;
-  return `${noteBeat.toFixed(6)}:${centerPosition.toFixed(6)}`;
-};
-
-const formatGroupedIds = (ids: number[]) => {
-  const sortedIds = [...ids].sort((a, b) => a - b);
-  const segments: string[] = [];
-  let rangeStart = sortedIds[0];
-  let previousId = sortedIds[0];
-
-  for (let index = 1; index <= sortedIds.length; index += 1) {
-    const currentId = sortedIds[index];
-    const continuesRange = currentId === previousId + 1;
-
-    if (continuesRange) {
-      previousId = currentId;
-      continue;
-    }
-
-    segments.push(
-      rangeStart === previousId ? `${rangeStart}` : `${rangeStart}-${previousId}`,
-    );
-
-    rangeStart = currentId;
-    previousId = currentId;
-  }
-
-  return segments.join(',');
-};
-
-const formatHistoryTimestamp = (timestamp: number) => (
-  new Intl.DateTimeFormat(undefined, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).format(timestamp)
-);
-
-const formatHistoryNumber = (value: number) => (
-  Number.isInteger(value) ? value.toString() : Number(value.toFixed(3)).toString()
-);
-
-const formatPlaybackSpeed = (speed: number) => `${formatHistoryNumber(speed)}x`;
-
-const applyAudioPlaybackSpeed = (audio: HTMLAudioElement, speed: number) => {
-  const pitchedAudio = audio as HTMLAudioElement & {
-    preservesPitch?: boolean;
-    mozPreservesPitch?: boolean;
-    webkitPreservesPitch?: boolean;
-  };
-
-  pitchedAudio.preservesPitch = false;
-  pitchedAudio.mozPreservesPitch = false;
-  pitchedAudio.webkitPreservesPitch = false;
-  audio.playbackRate = speed;
-};
-
-const formatMaybeValue = (value: unknown) => (
-  value === undefined || value === null || value === '' ? 'None' : String(value)
-);
-
-const formatNoteName = (note: Note) => NOTE_TYPES[note.type]?.name || `Type ${note.type}`;
-const formatNoteLane = (lane: number) => formatHistoryNumber(lane + 1);
 const APPEAR_MODE_OPTIONS = ['none', 'L', 'R', 'H', 'P'] as const;
-const formatTimingPosition = (measure: number, beat: number) => (
-  `Measure ${measure}, Beat ${beat}`
-);
-
-const operationCategoryStyles: Record<OperationCategory, string> = {
-  note: 'border-sky-500/30 bg-sky-500/10 text-sky-200',
-  timing: 'border-amber-500/30 bg-amber-500/10 text-amber-200',
-  speed: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200',
-  metadata: 'border-violet-500/30 bg-violet-500/10 text-violet-200',
-};
-
-interface VirtualizedChangeListProps<T> {
-  items: T[];
-  rowHeight: number;
-  overscan?: number;
-  className?: string;
-  getKey: (item: T, index: number) => React.Key;
-  renderRow: (item: T, index: number, style: React.CSSProperties) => React.ReactNode;
-}
-
-function VirtualizedChangeList<T>({
-  items,
-  rowHeight,
-  overscan = 6,
-  className = '',
-  getKey,
-  renderRow,
-}: VirtualizedChangeListProps<T>) {
-  const viewportRef = useRef<HTMLDivElement | null>(null);
-  const [scrollTop, setScrollTop] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(0);
-
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-
-    const updateViewportHeight = () => setViewportHeight(viewport.clientHeight);
-    updateViewportHeight();
-
-    const resizeObserver = new ResizeObserver(updateViewportHeight);
-    resizeObserver.observe(viewport);
-
-    return () => resizeObserver.disconnect();
-  }, []);
-
-  const totalHeight = items.length * rowHeight;
-  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
-  const endIndex = Math.min(
-    items.length,
-    Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan
-  );
-  const visibleItems = items.slice(startIndex, endIndex);
-
-  return (
-    <div
-      ref={viewportRef}
-      className={`relative overflow-y-auto ${className}`}
-      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
-    >
-      <div className="relative" style={{ height: totalHeight }}>
-        {visibleItems.map((item, visibleIndex) => {
-          const index = startIndex + visibleIndex;
-
-          return (
-            <React.Fragment key={getKey(item, index)}>
-              {renderRow(item, index, {
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                height: rowHeight,
-                transform: `translateY(${index * rowHeight}px)`,
-              })}
-            </React.Fragment>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-interface CommitInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'defaultValue' | 'onChange' | 'onBlur' | 'onKeyDown'> {
-  value: string | number;
-  onCommit: (value: string) => void;
-}
-
-function CommitInput({ value, onCommit, ...inputProps }: CommitInputProps) {
-  const [draftValue, setDraftValue] = useState(String(value ?? ''));
-  const lastCommittedDraftRef = useRef(String(value ?? ''));
-
-  useEffect(() => {
-    const nextValue = String(value ?? '');
-    setDraftValue(nextValue);
-    lastCommittedDraftRef.current = nextValue;
-  }, [value]);
-
-  const commitDraft = () => {
-    if (draftValue === lastCommittedDraftRef.current) {
-      return;
-    }
-
-    lastCommittedDraftRef.current = draftValue;
-    onCommit(draftValue);
-  };
-
-  return (
-    <input
-      {...inputProps}
-      value={draftValue}
-      onChange={(event) => setDraftValue(event.target.value)}
-      onBlur={commitDraft}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter') {
-          commitDraft();
-          event.currentTarget.blur();
-        }
-      }}
-    />
-  );
-}
 
 export default function Editor({ 
   onBack, 
@@ -491,8 +156,6 @@ export default function Editor({
     songIllustration: null as File | null,
   });
   const [illustrationPreview, setIllustrationPreview] = useState<string | null>(null);
-  const canTypeHaveParent = (type: number) => HOLD_CENTER_TYPES.includes(type) || HOLD_END_TYPES.includes(type);
-  const shouldOmitParentForType = (type: number) => !canTypeHaveParent(type);
 
   useEffect(() => {
     if (isLeftPanelCompact) {
@@ -780,48 +443,53 @@ export default function Editor({
     return `${formatNoteName(note)} #${note.id} at ${formatTime(note.time, timedBpmChanges)}, lane ${formatNoteLane(note.lane)}, width ${formatHistoryNumber(note.width)}`;
   }, [timedBpmChanges]);
 
-  const noteRenderIndex = useMemo(() => {
-    const notesById = new Map<number, Note>();
-    const noteBeats = new Map<number, number>();
-    const groupedNoteIds = new Map<string, number[]>();
-    const groupedIdLabelsByNoteId = new Map<number, string>();
+  const noteRenderIndex = useMemo(
+    () => buildNoteRenderIndex(notes, timedBpmChanges, selectedNoteIdSet),
+    [notes, timedBpmChanges, selectedNoteIdSet],
+  );
 
-    notes.forEach((note) => {
-      const noteBeat = getBeatAtTime(note.time, timedBpmChanges);
+  const finishPendingDrag = useCallback(() => {
+    if (dragUpdateFrameRef.current) {
+      cancelAnimationFrame(dragUpdateFrameRef.current);
+      dragUpdateFrameRef.current = undefined;
+    }
 
-      notesById.set(note.id, note);
-      noteBeats.set(note.id, noteBeat);
+    const pendingUpdate = pendingDragUpdateRef.current;
+    const dragStartNote = dragStartNoteRef.current;
+    let dragEndNote = dragStartNote
+      ? stateRef.current.notes.find(note => note.id === dragStartNote.id) || null
+      : null;
 
-      const key = getNoteIdGroupKey(note, noteBeat);
-      const groupedIds = groupedNoteIds.get(key);
-      if (groupedIds) {
-        groupedIds.push(note.id);
-      } else {
-        groupedNoteIds.set(key, [note.id]);
+    if (pendingUpdate) {
+      if (dragStartNote && dragStartNote.id === pendingUpdate.noteId) {
+        dragEndNote = { ...dragStartNote, time: pendingUpdate.time, lane: pendingUpdate.lane };
       }
-    });
 
-    groupedNoteIds.forEach((groupedIds) => {
-      const label = formatGroupedIds(groupedIds);
-      groupedIds.forEach((noteId) => {
-        groupedIdLabelsByNoteId.set(noteId, label);
+      setNotes((prev) => prev.map((note) => {
+        if (note.id !== pendingUpdate.noteId) {
+          return note;
+        }
+
+        if (note.time === pendingUpdate.time && note.lane === pendingUpdate.lane) {
+          return note;
+        }
+
+        return { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane };
+      }));
+      pendingDragUpdateRef.current = null;
+    }
+
+    if (dragStartNote && dragEndNote && (dragStartNote.time !== dragEndNote.time || dragStartNote.lane !== dragEndNote.lane)) {
+      recordOperation({
+        category: 'note',
+        title: 'Moved note',
+        detail: `#${dragStartNote.id} from ${formatTime(dragStartNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragStartNote.lane)} to ${formatTime(dragEndNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragEndNote.lane)}`,
       });
-    });
+    }
 
-    const selectedParentNoteIds = new Set<number>();
-    notes.forEach((note) => {
-      if (selectedNoteIdSet.has(note.id) && canTypeHaveParent(note.type) && note.parentId !== null) {
-        selectedParentNoteIds.add(note.parentId);
-      }
-    });
-
-    return {
-      notesById,
-      noteBeats,
-      groupedIdLabelsByNoteId,
-      selectedParentNoteIds,
-    };
-  }, [notes, timedBpmChanges, selectedNoteIdSet]);
+    dragStartNoteRef.current = null;
+    setDraggingNoteId(null);
+  }, [recordOperation, setNotes, timedBpmChanges]);
 
   useEffect(() => {
     const hitSoundEventsByKey = new Map<string, HitSoundEvent>();
@@ -845,12 +513,11 @@ export default function Editor({
 
   useEffect(() => {
     const handleMouseUp = () => {
-      setDraggingNoteId(null);
-      dragStartNoteRef.current = null;
+      finishPendingDrag();
     };
     window.addEventListener('mouseup', handleMouseUp);
     return () => window.removeEventListener('mouseup', handleMouseUp);
-  }, []);
+  }, [finishPendingDrag]);
 
   useEffect(() => {
     return () => {
@@ -1584,6 +1251,31 @@ export default function Editor({
     
     const startBeat = Math.floor(currentBeat - beatsVisibleBelow);
     const endBeat = Math.ceil(currentBeat + beatsVisibleAbove);
+    const noteVisibilityPaddingBeats = 50 / pixelsPerBeat;
+    const visibleStartBeat = currentBeat - beatsVisibleBelow - noteVisibilityPaddingBeats;
+    const visibleEndBeat = currentBeat + beatsVisibleAbove + noteVisibilityPaddingBeats;
+    const pendingDragUpdate = pendingDragUpdateRef.current;
+    const pendingDragBeat = pendingDragUpdate
+      ? getBeatAtTime(pendingDragUpdate.time, sortedChanges)
+      : null;
+    const visibleNoteEntries = getNoteBeatEntriesInRange(
+      noteRenderIndex.noteBeatEntries,
+      visibleStartBeat,
+      visibleEndBeat,
+    );
+
+    if (
+      pendingDragUpdate &&
+      pendingDragBeat !== null &&
+      pendingDragBeat >= visibleStartBeat &&
+      pendingDragBeat <= visibleEndBeat &&
+      !visibleNoteEntries.some(({ note }) => note.id === pendingDragUpdate.noteId)
+    ) {
+      const draggedNote = noteRenderIndex.notesById.get(pendingDragUpdate.noteId);
+      if (draggedNote) {
+        visibleNoteEntries.push({ note: draggedNote, beat: pendingDragBeat });
+      }
+    }
 
     // Pre-calculate measure boundaries
     const measureBoundaries = new Set<number>();
@@ -1743,22 +1435,30 @@ export default function Editor({
     });
 
     // Draw hold connections before note bodies so linked notes render on top.
-    stateRef.current.notes.forEach(note => {
-      if (!HOLD_CONNECTOR_TYPES.includes(note.type) || HOLD_START_TYPES.includes(note.type) || note.parentId === null) {
-        return;
+    for (const segment of noteRenderIndex.holdConnectorSegments) {
+      const noteBeat = segment.note.id === pendingDragUpdate?.noteId && pendingDragBeat !== null
+        ? pendingDragBeat
+        : segment.noteBeat;
+      const parentBeat = segment.parentNote.id === pendingDragUpdate?.noteId && pendingDragBeat !== null
+        ? pendingDragBeat
+        : segment.parentBeat;
+      const minSegmentBeat = Math.min(noteBeat, parentBeat);
+      const maxSegmentBeat = Math.max(noteBeat, parentBeat);
+
+      if (!pendingDragUpdate && minSegmentBeat > visibleEndBeat) {
+        break;
       }
 
-      const parentNote = noteRenderIndex.notesById.get(note.parentId);
-      if (!parentNote) {
-        return;
+      if (minSegmentBeat > visibleEndBeat || maxSegmentBeat < visibleStartBeat) {
+        continue;
       }
 
-      const noteBeat = noteRenderIndex.noteBeats.get(note.id);
-      const parentBeat = noteRenderIndex.noteBeats.get(parentNote.id);
-      if (noteBeat === undefined || parentBeat === undefined) {
-        return;
-      }
-
+      const note = segment.note.id === pendingDragUpdate?.noteId
+        ? { ...segment.note, lane: pendingDragUpdate.lane, time: pendingDragUpdate.time }
+        : segment.note;
+      const parentNote = segment.parentNote.id === pendingDragUpdate?.noteId
+        ? { ...segment.parentNote, lane: pendingDragUpdate.lane, time: pendingDragUpdate.time }
+        : segment.parentNote;
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       const parentY = hitLineY - (parentBeat - currentBeat) * pixelsPerBeat;
 
@@ -1778,101 +1478,105 @@ export default function Editor({
       ctx.closePath();
       ctx.fill();
       objectCount += 1;
-    });
+    }
 
     // Draw notes
-    stateRef.current.notes.forEach(note => {
-      const noteBeat = noteRenderIndex.noteBeats.get(note.id);
-      if (noteBeat === undefined) {
+    visibleNoteEntries.forEach(({ note, beat: noteBeat }) => {
+      const renderedNote = note.id === pendingDragUpdate?.noteId
+        ? { ...note, lane: pendingDragUpdate.lane, time: pendingDragUpdate.time }
+        : note;
+      const renderedNoteBeat = note.id === pendingDragUpdate?.noteId && pendingDragBeat !== null
+        ? pendingDragBeat
+        : noteBeat;
+
+      if (renderedNoteBeat < visibleStartBeat || renderedNoteBeat > visibleEndBeat) {
         return;
       }
 
-      const y = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
-      
-      if (y > -50 && y < height + 50) {
-        const x = startX + note.lane * laneWidth;
-        const notePixelWidth = (laneWidth / 2) * note.width;
-        const noteCenterX = x + notePixelWidth / 2;
+      const y = hitLineY - (renderedNoteBeat - currentBeat) * pixelsPerBeat;
+
+      const x = startX + renderedNote.lane * laneWidth;
+      const notePixelWidth = (laneWidth / 2) * renderedNote.width;
+      const noteCenterX = x + notePixelWidth / 2;
         
-        const noteTypeInfo = NOTE_TYPES[note.type] || UNKNOWN_NOTE_TYPE;
-        ctx.fillStyle = noteTypeInfo.color;
-        ctx.fillRect(x + 2, y - 10, notePixelWidth - 4, 20);
+      const noteTypeInfo = NOTE_TYPES[renderedNote.type] || UNKNOWN_NOTE_TYPE;
+      ctx.fillStyle = noteTypeInfo.color;
+      ctx.fillRect(x + 2, y - 10, notePixelWidth - 4, 20);
         
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x + 2, y - 10, notePixelWidth - 4, 20);
+
+      if (renderedNote.type === 1 || renderedNote.type === 2) {
+        ctx.fillStyle = '#ffffff';
+        drawInvertedTriangle(x + notePixelWidth / 2, y, Math.min(notePixelWidth - 12, 12));
+      }
+
+      if (renderedNote.type === 9) {
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = 2;
-        ctx.strokeRect(x + 2, y - 10, notePixelWidth - 4, 20);
-
-        if (note.type === 1 || note.type === 2) {
-          ctx.fillStyle = '#ffffff';
-          drawInvertedTriangle(x + notePixelWidth / 2, y, Math.min(notePixelWidth - 12, 12));
-        }
-
-        if (note.type === 9) {
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 2;
-          drawCircleMark(noteCenterX, y, Math.min((notePixelWidth - 12) / 2, 6));
-        }
-
-        if (HOLD_START_TYPES.includes(note.type)) {
-          drawNoteLetter(noteCenterX, y, 'S');
-        }
-
-        if (HOLD_CENTER_TYPES.includes(note.type)) {
-          drawNoteLetter(noteCenterX, y, 'C');
-        }
-
-        if (HOLD_END_TYPES.includes(note.type)) {
-          drawNoteLetter(noteCenterX, y, 'E');
-        }
-
-        if (!(note.type in NOTE_TYPES)) {
-          drawNoteLetter(noteCenterX, y, '?');
-        }
-
-        if ([13, 14, 15, 16].includes(note.type)) {
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 2;
-
-          if (note.type === 13) {
-            drawArrow(noteCenterX, y, 'left', 10);
-          }
-
-          if (note.type === 14) {
-            drawArrow(noteCenterX, y, 'right', 10);
-          }
-
-          if (note.type === 15) {
-            drawArrow(noteCenterX, y, 'up', 10);
-          }
-
-          if (note.type === 16) {
-            drawArrow(noteCenterX, y, 'down', 10);
-          }
-        }
-
-        // Highlight if selected
-        if (selectedNoteIdSet.has(note.id)) {
-          ctx.setLineDash([]);
-          ctx.strokeStyle = '#ff00ff';
-          ctx.lineWidth = 4;
-          ctx.strokeRect(x, y - 12, notePixelWidth, 24);
-        } else if (noteRenderIndex.selectedParentNoteIds.has(note.id)) {
-          ctx.setLineDash([6, 4]);
-          ctx.strokeStyle = '#ff00ff';
-          ctx.lineWidth = 3;
-          ctx.strokeRect(x, y - 12, notePixelWidth, 24);
-          ctx.setLineDash([]);
-        }
-
-        // Draw note ID
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '10px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        const groupedIdsLabel = noteRenderIndex.groupedIdLabelsByNoteId.get(note.id) ?? `${note.id}`;
-        ctx.fillText(groupedIdsLabel, noteCenterX, y + 12);
-        objectCount += 1;
+        drawCircleMark(noteCenterX, y, Math.min((notePixelWidth - 12) / 2, 6));
       }
+
+      if (HOLD_START_TYPES.includes(renderedNote.type)) {
+        drawNoteLetter(noteCenterX, y, 'S');
+      }
+
+      if (HOLD_CENTER_TYPES.includes(renderedNote.type)) {
+        drawNoteLetter(noteCenterX, y, 'C');
+      }
+
+      if (HOLD_END_TYPES.includes(renderedNote.type)) {
+        drawNoteLetter(noteCenterX, y, 'E');
+      }
+
+      if (!(renderedNote.type in NOTE_TYPES)) {
+        drawNoteLetter(noteCenterX, y, '?');
+      }
+
+      if ([13, 14, 15, 16].includes(renderedNote.type)) {
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+
+        if (renderedNote.type === 13) {
+          drawArrow(noteCenterX, y, 'left', 10);
+        }
+
+        if (renderedNote.type === 14) {
+          drawArrow(noteCenterX, y, 'right', 10);
+        }
+
+        if (renderedNote.type === 15) {
+          drawArrow(noteCenterX, y, 'up', 10);
+        }
+
+        if (renderedNote.type === 16) {
+          drawArrow(noteCenterX, y, 'down', 10);
+        }
+      }
+
+      // Highlight if selected
+      if (selectedNoteIdSet.has(renderedNote.id)) {
+        ctx.setLineDash([]);
+        ctx.strokeStyle = '#ff00ff';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(x, y - 12, notePixelWidth, 24);
+      } else if (noteRenderIndex.selectedParentNoteIds.has(renderedNote.id)) {
+        ctx.setLineDash([6, 4]);
+        ctx.strokeStyle = '#ff00ff';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x, y - 12, notePixelWidth, 24);
+        ctx.setLineDash([]);
+      }
+
+      // Draw note ID
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '10px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const groupedIdsLabel = noteRenderIndex.groupedIdLabelsByNoteId.get(renderedNote.id) ?? `${renderedNote.id}`;
+      ctx.fillText(groupedIdsLabel, noteCenterX, y + 12);
+      objectCount += 1;
     });
 
     if (hoverPreview && !isCtrlHeld && !isShiftHeld) {
@@ -2148,13 +1852,19 @@ export default function Editor({
     
     const snappedTime = getTimeAtBeat(snappedBeat, sortedChanges);
 
-    const hitNotes = stateRef.current.notes.filter((note) => {
-      const noteBeat = noteRenderIndex.noteBeats.get(note.id) ?? getBeatAtTime(note.time, sortedChanges);
+    const noteHitPaddingBeats = 10 / pixelsPerBeat;
+    const hitNotes = getNoteBeatEntriesInRange(
+      noteRenderIndex.noteBeatEntries,
+      clickBeat - noteHitPaddingBeats,
+      clickBeat + noteHitPaddingBeats,
+    ).map(({ note, beat: noteBeat }) => {
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       const noteStartX = startX + note.lane * laneWidth;
       const noteEndX = noteStartX + (laneWidth / 2) * note.width;
-      return clickX >= noteStartX && clickX <= noteEndX && clickY >= noteY - 10 && clickY <= noteY + 10;
-    });
+      return clickX >= noteStartX && clickX <= noteEndX && clickY >= noteY - 10 && clickY <= noteY + 10
+        ? note
+        : null;
+    }).filter((note): note is Note => note !== null);
     const clickedNote = hitNotes.reduce<Note | null>((highestNote, note) => (
       !highestNote || note.id > highestNote.id ? note : highestNote
     ), null);
@@ -2291,22 +2001,8 @@ export default function Editor({
       if (!dragUpdateFrameRef.current) {
         dragUpdateFrameRef.current = requestAnimationFrame(() => {
           dragUpdateFrameRef.current = undefined;
-          const pendingUpdate = pendingDragUpdateRef.current;
-          if (!pendingUpdate) {
-            return;
-          }
-
-          setNotes((prev) => prev.map((note) => {
-            if (note.id !== pendingUpdate.noteId) {
-              return note;
-            }
-
-            if (note.time === pendingUpdate.time && note.lane === pendingUpdate.lane) {
-              return note;
-            }
-
-            return { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane };
-          }));
+          drawGrid();
+          setRenderedObjects(renderedObjectsRef.current);
         });
       }
     } else if (selectionBox) {
@@ -2342,43 +2038,7 @@ export default function Editor({
   };
 
   const handleCanvasMouseUp = () => {
-    if (dragUpdateFrameRef.current) {
-      cancelAnimationFrame(dragUpdateFrameRef.current);
-      dragUpdateFrameRef.current = undefined;
-    }
-    const pendingUpdate = pendingDragUpdateRef.current;
-    const dragStartNote = dragStartNoteRef.current;
-    let dragEndNote = dragStartNote
-      ? stateRef.current.notes.find(note => note.id === dragStartNote.id) || null
-      : null;
-
-    if (pendingUpdate) {
-      if (dragStartNote && dragStartNote.id === pendingUpdate.noteId) {
-        dragEndNote = { ...dragStartNote, time: pendingUpdate.time, lane: pendingUpdate.lane };
-      }
-
-      setNotes((prev) => prev.map((note) => {
-        if (note.id !== pendingUpdate.noteId) {
-          return note;
-        }
-
-        if (note.time === pendingUpdate.time && note.lane === pendingUpdate.lane) {
-          return note;
-        }
-
-        return { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane };
-      }));
-      pendingDragUpdateRef.current = null;
-    }
-
-    if (dragStartNote && dragEndNote && (dragStartNote.time !== dragEndNote.time || dragStartNote.lane !== dragEndNote.lane)) {
-      recordOperation({
-        category: 'note',
-        title: 'Moved note',
-        detail: `#${dragStartNote.id} from ${formatTime(dragStartNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragStartNote.lane)} to ${formatTime(dragEndNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragEndNote.lane)}`,
-      });
-    }
-    dragStartNoteRef.current = null;
+    finishPendingDrag();
 
     if (selectionBox) {
       const canvas = canvasRef.current;
@@ -2389,26 +2049,32 @@ export default function Editor({
         const gridWidth = lanes * laneWidth;
         const startX = (width - gridWidth) / 2;
         const hitLineY = height - 150;
-        const sortedChanges = convertBpmChangesToTime(stateRef.current.bpmChanges);
+        const sortedChanges = timedBpmChanges;
         const currentBeat = getBeatAtTime(stateRef.current.currentTime, sortedChanges);
 
         const minX = Math.min(selectionBox.startX, selectionBox.endX);
         const maxX = Math.max(selectionBox.startX, selectionBox.endX);
         const minY = Math.min(selectionBox.startY, selectionBox.endY);
         const maxY = Math.max(selectionBox.startY, selectionBox.endY);
+        const minBeat = currentBeat + (hitLineY - maxY) / pixelsPerBeat;
+        const maxBeat = currentBeat + (hitLineY - minY) / pixelsPerBeat;
 
-        const selected = stateRef.current.notes.filter(n => {
-          const noteBeat = getBeatAtTime(n.time, sortedChanges);
+        const selected = getNoteBeatEntriesInRange(
+          noteRenderIndex.noteBeatEntries,
+          minBeat,
+          maxBeat,
+        ).map(({ note: n, beat: noteBeat }) => {
           const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
           const noteStartX = startX + n.lane * laneWidth;
           const noteEndX = noteStartX + (laneWidth / 2) * n.width;
           
-          return noteStartX >= minX && noteEndX <= maxX && noteY >= minY && noteY <= maxY;
-        });
+          return noteStartX >= minX && noteEndX <= maxX && noteY >= minY && noteY <= maxY
+            ? n
+            : null;
+        }).filter((note): note is Note => note !== null);
         setSelectedNoteIds(selected.map(n => n.id));
       }
     }
-    setDraggingNoteId(null);
     setSelectionBox(null);
   };
 
