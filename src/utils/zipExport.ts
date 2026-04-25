@@ -72,6 +72,12 @@ const toBytes = async (data: ZipFileEntry['data']) => {
 };
 
 export const createZipBlob = async (entries: ZipFileEntry[]) => {
+  const zipBuffer = await createZipBuffer(entries);
+
+  return new Blob([zipBuffer], { type: 'application/zip' });
+};
+
+export const createZipBuffer = async (entries: ZipFileEntry[]) => {
   const fileRecords: Uint8Array[] = [];
   const centralRecords: Uint8Array[] = [];
   const now = new Date();
@@ -136,5 +142,13 @@ export const createZipBlob = async (entries: ZipFileEntry[]) => {
   writeUint32(endRecord, 16, centralDirectoryOffset);
   writeUint16(endRecord, 20, 0);
 
-  return new Blob([...fileRecords, ...centralRecords, endRecord], { type: 'application/zip' });
+  const output = new Uint8Array(offset + centralDirectorySize + endRecord.length);
+  let outputOffset = 0;
+
+  for (const record of [...fileRecords, ...centralRecords, endRecord]) {
+    output.set(record, outputOffset);
+    outputOffset += record.length;
+  }
+
+  return output.buffer;
 };

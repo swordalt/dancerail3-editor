@@ -95,7 +95,7 @@ function deployDist(remoteUrl) {
     runInDir(tempDir, 'git', ['init']);
     runInDir(tempDir, 'git', ['checkout', '-b', branchName]);
     runInDir(tempDir, 'git', ['add', '--all']);
-    runInDir(tempDir, 'git', ['commit', '-m', 'Deploy GitHub Pages']);
+    runInDir(tempDir, 'git', ['commit', '-m', 'Deploy to GH Pages']);
     runInDir(tempDir, 'git', ['remote', 'add', remoteName, remoteUrl]);
     runInDir(tempDir, 'git', ['push', '--force', remoteName, `${branchName}:${branchName}`]);
   } finally {

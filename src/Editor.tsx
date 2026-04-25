@@ -1,13 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowLeft, Settings, Play, Pause, Download, X, ChevronLeft, ChevronRight, Grid2x2, Grid2x2X } from 'lucide-react';
+import { ArrowLeft, Settings, Play, Pause, Download, X, ChevronLeft, ChevronRight, Grid2x2, Grid2x2X, HelpCircle } from 'lucide-react';
 import { convertBpmChangesToTime, getActiveChange, getBeatAtTime, getTimeAtBeat, formatTime } from './utils/editorUtils';
 import EditorModal from './components/EditorModal';
 import EditorCanvas from './components/EditorCanvas';
 import { NOTE_TYPES, AVAILABLE_NOTE_TYPES, HOLD_CONNECTOR_TYPES, HOLD_CENTER_TYPES, HOLD_END_TYPES, HOLD_START_TYPES, UNKNOWN_NOTE_TYPE, getConnectorFill } from './constants/editorConstants';
 import type { BpmChange, EditorFormData, EditorMode, Note, ProjectData, SelectionBox, SpeedChange } from './types/editorTypes';
-import { buildLevelText } from './utils/levelFormat';
-import { createZipBlob } from './utils/zipExport';
+import { createExportZipInWorker, warmExportWorker } from './utils/exportWorkerClient';
 
 const HIT_SOUND_URL = new URL('../hit.ogg', import.meta.url).href;
 const FLICK_SOUND_URL = new URL('../flick.ogg', import.meta.url).href;
@@ -18,23 +17,23 @@ const SOUND_URLS: Record<string, string> = {
 const HIT_SOUND_LOOKAHEAD_SECONDS = 0.12;
 const HIT_SOUND_JUMP_TOLERANCE_SECONDS = 0.25;
 const HOVER_PREVIEW_FRAME_INTERVAL_MS = 1000 / 30;
+const PAUSED_TIMELINE_RENDER_DURATION_MS = 120;
 const AUDIO_CLOCK_HANDOFF_DELAY_MS = 200;
 const AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS = 0.05;
 const AUDIO_SEEK_TIMEOUT_MS = 10000;
+const PLAYBACK_SPEED_OPTIONS = [1, 0.75, 0.5, 0.25, 1.25, 1.5, 1.75, 2] as const;
 const DEFAULT_PIXELS_PER_BEAT = 150;
 const MIN_PIXELS_PER_BEAT = 60;
 const MAX_PIXELS_PER_BEAT = 320;
 const EDITOR_SETTINGS_STORAGE_KEY = 'dancerail3-editor:settings';
 const SIDE_PANEL_TRANSITION_MS = 300;
-
-const getFileExtension = (file: File) => {
-  const extension = file.name.split('.').pop();
-  return extension && extension !== file.name ? extension : 'bin';
-};
+const STATISTICS_REFRESH_RATE_OPTIONS = ['15fps', '30fps', '60fps', 'max'] as const;
+type StatisticsRefreshRate = typeof STATISTICS_REFRESH_RATE_OPTIONS[number];
 
 interface EditorSettings {
   isExitWarningEnabled: boolean;
   isScrollDirectionInverted: boolean;
+  statisticsRefreshRate: StatisticsRefreshRate;
   musicVolume: number;
   tapSoundVolume: number;
   flickSoundVolume: number;
@@ -46,6 +45,7 @@ interface EditorSettings {
 const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   isExitWarningEnabled: true,
   isScrollDirectionInverted: false,
+  statisticsRefreshRate: '30fps',
   musicVolume: 1,
   tapSoundVolume: 1,
   flickSoundVolume: 1,
@@ -53,6 +53,54 @@ const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   isXPositionGridEnabled: true,
   pixelsPerBeat: DEFAULT_PIXELS_PER_BEAT,
 };
+
+const EDITOR_KEYBIND_GROUPS = [
+  {
+    title: 'Playback and Navigation',
+    bindings: [
+      { keys: ['Space'], description: 'Play or pause the song from the current editor time.' },
+      { keys: ['Mouse wheel'], description: 'Move through the timeline. Scrolling stops playback before seeking.' },
+    ],
+  },
+  {
+    title: 'Grid and View',
+    bindings: [
+      { keys: ['W'], description: 'Increase snap precision.' },
+      { keys: ['S'], description: 'Decrease snap precision.' },
+      { keys: ['R'], description: 'Zoom the timeline in by increasing pixels per beat.' },
+      { keys: ['F'], description: 'Zoom the timeline out by decreasing pixels per beat.' },
+    ],
+  },
+  {
+    title: 'Note Tools',
+    bindings: [
+      { keys: ['A'], description: 'Select the previous note type.' },
+      { keys: ['D'], description: 'Select the next note type.' },
+      { keys: ['Q'], description: 'Decrease the placement note width.' },
+      { keys: ['E'], description: 'Increase the placement note width.' },
+    ],
+  },
+  {
+    title: 'Canvas Editing',
+    bindings: [
+      { keys: ['Left click'], description: 'Place the selected note type on the snapped grid position.' },
+      { keys: ['Right click'], description: 'Delete the clicked note, or delete the selected group when clicking a selected note.' },
+      { keys: ['Middle click note'], description: 'Select the clicked note.' },
+      { keys: ['Middle drag empty space'], description: 'Draw a selection box.' },
+      { keys: ['Ctrl', 'Left click note'], description: 'Toggle a note in or out of the current selection.' },
+      { keys: ['Shift', 'Left click note'], description: 'Start moving the clicked note.' },
+      { keys: ['Shift', 'Middle click note'], description: 'Start moving the clicked note.' },
+      { keys: ['Delete'], description: 'Delete all selected notes.' },
+      { keys: ['Backspace'], description: 'Delete all selected notes.' },
+    ],
+  },
+  {
+    title: 'Fields',
+    bindings: [
+      { keys: ['Enter'], description: 'Commit the current input value and leave the field.' },
+    ],
+  },
+] as const;
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> => (
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -75,6 +123,19 @@ const isValidPixelsPerBeat = (value: unknown): value is number => (
   value <= MAX_PIXELS_PER_BEAT
 );
 
+const isValidStatisticsRefreshRate = (value: unknown): value is StatisticsRefreshRate => (
+  typeof value === 'string' &&
+  STATISTICS_REFRESH_RATE_OPTIONS.includes(value as StatisticsRefreshRate)
+);
+
+const getStatisticsRefreshIntervalMs = (refreshRate: StatisticsRefreshRate) => {
+  if (refreshRate === 'max') {
+    return 0;
+  }
+
+  return 1000 / Number(refreshRate.replace('fps', ''));
+};
+
 const loadEditorSettings = (): EditorSettings => {
   if (typeof window === 'undefined') return DEFAULT_EDITOR_SETTINGS;
 
@@ -92,6 +153,9 @@ const loadEditorSettings = (): EditorSettings => {
       isScrollDirectionInverted: typeof parsedSettings.isScrollDirectionInverted === 'boolean'
         ? parsedSettings.isScrollDirectionInverted
         : DEFAULT_EDITOR_SETTINGS.isScrollDirectionInverted,
+      statisticsRefreshRate: isValidStatisticsRefreshRate(parsedSettings.statisticsRefreshRate)
+        ? parsedSettings.statisticsRefreshRate
+        : DEFAULT_EDITOR_SETTINGS.statisticsRefreshRate,
       musicVolume: isValidVolume(parsedSettings.musicVolume)
         ? parsedSettings.musicVolume
         : DEFAULT_EDITOR_SETTINGS.musicVolume,
@@ -146,6 +210,7 @@ interface EditorRuntimeState {
   playbackStartTime: number;
   playbackStartPerformanceTime: number;
   playbackAudioClockReadyTime: number;
+  playbackSpeed: number;
   bpm: number;
   bpmChanges: BpmChange[];
   speedChanges: SpeedChange[];
@@ -225,12 +290,28 @@ const formatHistoryNumber = (value: number) => (
   Number.isInteger(value) ? value.toString() : Number(value.toFixed(3)).toString()
 );
 
+const formatPlaybackSpeed = (speed: number) => `${formatHistoryNumber(speed)}x`;
+
+const applyAudioPlaybackSpeed = (audio: HTMLAudioElement, speed: number) => {
+  const pitchedAudio = audio as HTMLAudioElement & {
+    preservesPitch?: boolean;
+    mozPreservesPitch?: boolean;
+    webkitPreservesPitch?: boolean;
+  };
+
+  pitchedAudio.preservesPitch = false;
+  pitchedAudio.mozPreservesPitch = false;
+  pitchedAudio.webkitPreservesPitch = false;
+  audio.playbackRate = speed;
+};
+
 const formatMaybeValue = (value: unknown) => (
   value === undefined || value === null || value === '' ? 'None' : String(value)
 );
 
 const formatNoteName = (note: Note) => NOTE_TYPES[note.type]?.name || `Type ${note.type}`;
 const formatNoteLane = (lane: number) => formatHistoryNumber(lane + 1);
+const APPEAR_MODE_OPTIONS = ['none', 'L', 'R', 'H', 'P'] as const;
 const formatTimingPosition = (measure: number, beat: number) => (
   `Measure ${measure}, Beat ${beat}`
 );
@@ -368,10 +449,14 @@ export default function Editor({
   const initialEditorSettings = useMemo(loadEditorSettings, []);
   const [isModalOpen, setIsModalOpen] = useState(mode === 'new');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [isPlaybackSpeedMenuOpen, setIsPlaybackSpeedMenuOpen] = useState(false);
+  const [isStatisticsRefreshRateMenuOpen, setIsStatisticsRefreshRateMenuOpen] = useState(false);
   const [isExitWarningOpen, setIsExitWarningOpen] = useState(false);
   const [isExitWarningEnabled, setIsExitWarningEnabled] = useState(initialEditorSettings.isExitWarningEnabled);
   const [isScrollDirectionInverted, setIsScrollDirectionInverted] = useState(initialEditorSettings.isScrollDirectionInverted);
+  const [statisticsRefreshRate, setStatisticsRefreshRate] = useState<StatisticsRefreshRate>(initialEditorSettings.statisticsRefreshRate);
   const [musicVolume, setMusicVolume] = useState(initialEditorSettings.musicVolume);
   const [tapSoundVolume, setTapSoundVolume] = useState(initialEditorSettings.tapSoundVolume);
   const [flickSoundVolume, setFlickSoundVolume] = useState(initialEditorSettings.flickSoundVolume);
@@ -449,6 +534,7 @@ export default function Editor({
     saveEditorSettings({
       isExitWarningEnabled,
       isScrollDirectionInverted,
+      statisticsRefreshRate,
       musicVolume,
       tapSoundVolume,
       flickSoundVolume,
@@ -459,6 +545,7 @@ export default function Editor({
   }, [
     isExitWarningEnabled,
     isScrollDirectionInverted,
+    statisticsRefreshRate,
     musicVolume,
     tapSoundVolume,
     flickSoundVolume,
@@ -480,9 +567,12 @@ export default function Editor({
   const [projectData, setProjectData] = useState<ProjectData | null>(initialProjectData);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [liveStatsTime, setLiveStatsTime] = useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
   const [duration, setDuration] = useState(0);
   const [fps, setFps] = useState(0);
   const [renderedObjects, setRenderedObjects] = useState(0);
+  const [isPausedTimelineRendering, setIsPausedTimelineRendering] = useState(false);
   
   const audioRef = useRef<HTMLAudioElement>(null);
   const musicAudioContextRef = useRef<AudioContext | null>(null);
@@ -499,9 +589,12 @@ export default function Editor({
   const containerRef = useRef<HTMLDivElement>(null);
   const requestRef = useRef<number>();
   const hoverPreviewTimeoutRef = useRef<number>();
+  const pausedTimelineRenderTimeoutRef = useRef<number>();
+  const pausedTimelineRenderUntilRef = useRef(0);
   const fpsFrameCountRef = useRef(0);
   const fpsWindowStartRef = useRef(performance.now());
   const renderedObjectsRef = useRef(0);
+  const liveStatsLastUpdateRef = useRef(0);
   const timeDisplayRef = useRef<HTMLDivElement>(null);
   const progressBarRef = useRef<HTMLInputElement>(null);
   const isDraggingProgress = useRef(false);
@@ -510,9 +603,36 @@ export default function Editor({
   const dragUpdateFrameRef = useRef<number>();
   const hoverPreviewRef = useRef<HoverPreview | null>(null);
   const playRequestIdRef = useRef(0);
+  const playTimeoutRef = useRef<number>();
+
+  const renderPausedTimelineAtFullFps = useCallback(() => {
+    pausedTimelineRenderUntilRef.current = performance.now() + PAUSED_TIMELINE_RENDER_DURATION_MS;
+    setIsPausedTimelineRendering(true);
+
+    if (pausedTimelineRenderTimeoutRef.current !== undefined) {
+      window.clearTimeout(pausedTimelineRenderTimeoutRef.current);
+    }
+
+    pausedTimelineRenderTimeoutRef.current = window.setTimeout(() => {
+      pausedTimelineRenderTimeoutRef.current = undefined;
+      if (performance.now() >= pausedTimelineRenderUntilRef.current) {
+        setIsPausedTimelineRendering(false);
+      }
+    }, PAUSED_TIMELINE_RENDER_DURATION_MS);
+  }, []);
 
   const openSettings = () => {
+    setIsHelpOpen(false);
+    setIsPlaybackSpeedMenuOpen(false);
+    setIsStatisticsRefreshRateMenuOpen(false);
     setIsSettingsOpen(true);
+  };
+
+  const openHelp = () => {
+    setIsSettingsOpen(false);
+    setIsPlaybackSpeedMenuOpen(false);
+    setIsStatisticsRefreshRateMenuOpen(false);
+    setIsHelpOpen(true);
   };
 
   const openExitWarning = () => {
@@ -560,12 +680,25 @@ export default function Editor({
     playbackStartTime: 0,
     playbackStartPerformanceTime: 0,
     playbackAudioClockReadyTime: 0,
+    playbackSpeed: 1,
     bpm: 120,
     bpmChanges: [{ measure: 0, beat: 0, bpm: 120, timeSignature: '4/4' }],
     speedChanges: [{ measure: 0, beat: 0, speedChange: 1 }],
     offset: 0,
     notes: [],
   });
+
+  useEffect(() => {
+    const warmWorker = () => warmExportWorker();
+
+    if ('requestIdleCallback' in window) {
+      const idleCallbackId = window.requestIdleCallback(warmWorker, { timeout: 1000 });
+      return () => window.cancelIdleCallback(idleCallbackId);
+    }
+
+    const timeoutId = window.setTimeout(warmWorker, 250);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
 
   useEffect(() => {
     setupMusicGain();
@@ -584,7 +717,19 @@ export default function Editor({
     stateRef.current.offset = offset;
     stateRef.current.notes = notes;
     stateRef.current.speedChanges = speedChanges;
-  }, [isPlaying, currentTime, projectData, bpmChanges, offset, notes, speedChanges]);
+    stateRef.current.playbackSpeed = playbackSpeed;
+  }, [isPlaying, currentTime, projectData, bpmChanges, offset, notes, speedChanges, playbackSpeed]);
+
+  useEffect(() => {
+    if (!isPlaying) {
+      setLiveStatsTime(currentTime);
+    }
+  }, [currentTime, isPlaying]);
+
+  const statisticsRefreshIntervalMs = useMemo(
+    () => getStatisticsRefreshIntervalMs(statisticsRefreshRate),
+    [statisticsRefreshRate],
+  );
 
   useEffect(() => {
     if (draggingNoteId || selectionBox) {
@@ -884,7 +1029,8 @@ export default function Editor({
     if (timeDisplayRef.current && projectData) {
       timeDisplayRef.current.textContent = formatTime(newTime, sortedChanges);
     }
-  }, [projectData, offset, gridZoom]);
+    renderPausedTimelineAtFullFps();
+  }, [projectData, offset, gridZoom, renderPausedTimelineAtFullFps]);
 
   const stopHitsounds = () => {
     activeHitSounds.current.forEach(source => {
@@ -920,7 +1066,7 @@ export default function Editor({
     const projectedTime = Math.max(
       0,
       stateRef.current.playbackStartTime
-        + (now - stateRef.current.playbackStartPerformanceTime) / 1000,
+        + ((now - stateRef.current.playbackStartPerformanceTime) / 1000) * stateRef.current.playbackSpeed,
     );
 
     if (audio && !audio.paused && !audio.seeking && now >= stateRef.current.playbackAudioClockReadyTime) {
@@ -931,6 +1077,50 @@ export default function Editor({
     }
 
     return projectedTime;
+  };
+
+  const clearPlayTimeout = () => {
+    if (playTimeoutRef.current !== undefined) {
+      window.clearTimeout(playTimeoutRef.current);
+      playTimeoutRef.current = undefined;
+    }
+  };
+
+  const changePlaybackSpeed = (nextSpeed: number) => {
+    const audio = audioRef.current;
+    const now = performance.now();
+    const offsetInSeconds = parseFloat(offset.toString()) / 1000;
+    const playbackTime = getPlaybackTimeFromClock(audio, offsetInSeconds);
+
+    stateRef.current.playbackSpeed = nextSpeed;
+    stateRef.current.playbackStartTime = playbackTime;
+    stateRef.current.playbackStartPerformanceTime = now;
+    stateRef.current.playbackAudioClockReadyTime = now + AUDIO_CLOCK_HANDOFF_DELAY_MS;
+
+    if (audio) {
+      applyAudioPlaybackSpeed(audio, nextSpeed);
+    }
+
+    if (stateRef.current.isPlaying && audio && audio.paused && offsetInSeconds > 0) {
+      clearPlayTimeout();
+      const audioStartTime = playbackTime - offsetInSeconds;
+      audio.currentTime = Math.max(0, audioStartTime);
+
+      if (audioStartTime < 0) {
+        playTimeoutRef.current = window.setTimeout(() => {
+          playTimeoutRef.current = undefined;
+          if (stateRef.current.isPlaying && audioRef.current) {
+            applyAudioPlaybackSpeed(audioRef.current, stateRef.current.playbackSpeed);
+            audioRef.current.play().catch(() => {});
+          }
+        }, (-audioStartTime / nextSpeed) * 1000);
+      } else {
+        audio.play().catch(() => {});
+      }
+    }
+
+    setPlaybackSpeed(nextSpeed);
+    setIsPlaybackSpeedMenuOpen(false);
   };
 
   const seekAudioToTime = (audio: HTMLAudioElement, time: number) => new Promise<void>((resolve) => {
@@ -969,10 +1159,7 @@ export default function Editor({
       const playbackTime = Math.max(0, stateRef.current.currentTime);
       stopHitsounds();
       audioRef.current.pause();
-      // Clear any pending timeout if they were about to play
-      if (window.hasOwnProperty('playTimeout')) {
-        clearTimeout((window as any).playTimeout);
-      }
+      clearPlayTimeout();
       if (requestRef.current) {
         cancelAnimationFrame(requestRef.current);
         requestRef.current = undefined;
@@ -1012,6 +1199,7 @@ export default function Editor({
       if (musicContext?.state === 'suspended') {
         musicContext.resume().catch(() => {});
       }
+      applyAudioPlaybackSpeed(audioRef.current, stateRef.current.playbackSpeed);
       void prepareHitSounds();
       hitSoundCursorRef.current = findHitSoundCursor(playbackStartTime);
       scheduledHitSoundKeysRef.current.clear();
@@ -1021,10 +1209,12 @@ export default function Editor({
         // Delay music: Editor starts at current time, Music starts playing after offsetInSeconds past audio seek point
         const audioStartTime = playbackStartTime - offsetInSeconds;
         audioRef.current.currentTime = Math.max(0, audioStartTime);
-        const audioDelaySeconds = Math.max(0, -audioStartTime);
-        (window as any).playTimeout = setTimeout(() => {
+        const audioDelaySeconds = Math.max(0, -audioStartTime) / stateRef.current.playbackSpeed;
+        playTimeoutRef.current = window.setTimeout(() => {
+          playTimeoutRef.current = undefined;
           if (playRequestIdRef.current === playRequestId && audioRef.current) {
-            audioRef.current.play();
+            applyAudioPlaybackSpeed(audioRef.current, stateRef.current.playbackSpeed);
+            audioRef.current.play().catch(() => {});
           }
         }, audioDelaySeconds * 1000);
       } else {
@@ -1290,8 +1480,6 @@ export default function Editor({
     const sortedChanges = timedBpmChanges;
     const offsetInSeconds = parseFloat(offset.toString()) / 1000;
 
-    const activeChange = getActiveChange(stateRef.current.currentTime, sortedChanges);
-    const bpm = activeChange.bpm;
     let time = stateRef.current.currentTime;
     
     if (stateRef.current.isPlaying && audioRef.current) {
@@ -1430,7 +1618,7 @@ export default function Editor({
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`SC: ${sc.speedChange.toFixed(1)}x`, indicatorX, y - (sharesTimeWithBpm ? indicatorOffset : 0));
+        ctx.fillText(`SC: ${sc.speedChange}x`, indicatorX, y - (sharesTimeWithBpm ? indicatorOffset : 0));
         objectCount += 1;
       }
     });
@@ -1678,13 +1866,15 @@ export default function Editor({
 
   }, [pixelsPerBeat, projectData, gridZoom, isXPositionGridEnabled, hoverPreview, isCtrlHeld, isShiftHeld, noteWidth, selectedNoteIdSet, selectedNoteType, selectionBox, timedBpmChanges, noteRenderIndex, offset]);
 
-  const shouldAnimateCanvas = isPlaying || (!!hoverPreview && !isCtrlHeld && !isShiftHeld);
+  const shouldAnimateCanvas = isPlaying || isPausedTimelineRendering || (!!hoverPreview && !isCtrlHeld && !isShiftHeld);
 
   const update = useCallback(() => {
     if (stateRef.current.isPlaying && audioRef.current) {
       const offsetInSeconds = parseFloat(offset.toString()) / 1000;
+      const activePlaybackSpeed = stateRef.current.playbackSpeed;
       const currentTime = getPlaybackTimeFromClock(audioRef.current, offsetInSeconds);
-      const scheduleUntil = currentTime + HIT_SOUND_LOOKAHEAD_SECONDS;
+      const now = performance.now();
+      const scheduleUntil = currentTime + HIT_SOUND_LOOKAHEAD_SECONDS * activePlaybackSpeed;
       const lastTime = lastPlayedTimeRef.current;
 
       if (currentTime + HIT_SOUND_JUMP_TOLERANCE_SECONDS < lastTime) {
@@ -1708,7 +1898,7 @@ export default function Editor({
         const event = events[cursor];
         if (!scheduledHitSoundKeysRef.current.has(event.key)) {
           scheduledHitSoundKeysRef.current.add(event.key);
-          playHitSound(event.soundUrl, event.time - currentTime);
+          playHitSound(event.soundUrl, (event.time - currentTime) / activePlaybackSpeed);
         }
         cursor += 1;
       }
@@ -1716,6 +1906,11 @@ export default function Editor({
       hitSoundCursorRef.current = cursor;
       
       lastPlayedTimeRef.current = scheduleUntil;
+
+      if (now - liveStatsLastUpdateRef.current >= statisticsRefreshIntervalMs) {
+        liveStatsLastUpdateRef.current = now;
+        setLiveStatsTime(currentTime);
+      }
     } else {
       lastPlayedTimeRef.current = stateRef.current.currentTime;
     }
@@ -1723,6 +1918,8 @@ export default function Editor({
     drawGrid();
     setRenderedObjects(renderedObjectsRef.current);
     if (stateRef.current.isPlaying) {
+      requestRef.current = requestAnimationFrame(update);
+    } else if (isPausedTimelineRendering && performance.now() < pausedTimelineRenderUntilRef.current) {
       requestRef.current = requestAnimationFrame(update);
     } else if (hoverPreview && !isCtrlHeld && !isShiftHeld) {
       hoverPreviewTimeoutRef.current = window.setTimeout(() => {
@@ -1732,7 +1929,7 @@ export default function Editor({
     } else {
       requestRef.current = undefined;
     }
-  }, [drawGrid, offset, playHitSound, hoverPreview, isCtrlHeld, isShiftHeld]);
+  }, [drawGrid, offset, playHitSound, hoverPreview, isCtrlHeld, isShiftHeld, isPausedTimelineRendering, statisticsRefreshIntervalMs]);
 
   useEffect(() => {
     if (!shouldAnimateCanvas) {
@@ -1769,6 +1966,15 @@ export default function Editor({
       }
     };
   }, [drawGrid, shouldAnimateCanvas, update]);
+
+  useEffect(() => {
+    return () => {
+      if (pausedTimelineRenderTimeoutRef.current !== undefined) {
+        window.clearTimeout(pausedTimelineRenderTimeoutRef.current);
+        pausedTimelineRenderTimeoutRef.current = undefined;
+      }
+    };
+  }, []);
 
   const getLaneFromCanvasX = (
     canvasX: number,
@@ -2125,10 +2331,12 @@ export default function Editor({
     if (progressBarRef.current && !isDraggingProgress.current) {
       progressBarRef.current.value = newTime.toString();
     }
+    renderPausedTimelineAtFullFps();
   };
 
-  const saveZipBlob = async (zipBlob: Blob, suggestedName: string, errorLabel: string) => {
+  const saveZipData = async (zipBuffer: ArrayBuffer, suggestedName: string, errorLabel: string) => {
     const fallbackDownload = () => {
+      const zipBlob = new Blob([zipBuffer], { type: 'application/zip' });
       const url = URL.createObjectURL(zipBlob);
       const anchor = document.createElement('a');
 
@@ -2148,7 +2356,7 @@ export default function Editor({
           }],
         });
         const writable = await handle.createWritable();
-        await writable.write(zipBlob);
+        await writable.write(zipBuffer);
         await writable.close();
       } catch (err) {
         if ((err as Error).name !== 'AbortError') {
@@ -2161,82 +2369,40 @@ export default function Editor({
     }
   };
 
-  const getChartText = () => {
-    if (!projectData) return '';
-
-    return buildLevelText({
-      projectData,
-      notes,
-      bpmChanges,
-      speedChanges,
-      offset,
-    });
-  };
-
-  const getFirstBpm = () => {
-    const firstChange = [...bpmChanges]
-      .sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat))[0];
-
-    return firstChange?.bpm ?? projectData?.bpm ?? 120;
-  };
-
   const exportDr3Viewer = async () => {
     if (!projectData || !projectData.songFile || hasExportIncompatibleTimeSignature) return;
 
-    const songId = projectData.songId || 'level';
-    const difficulty = projectData.difficulty || '0';
-    const entries = [
-      {
-        name: `${songId}.${difficulty}.txt`,
-        data: getChartText(),
-      },
-      {
-        name: `${songId}.${getFileExtension(projectData.songFile)}`,
-        data: projectData.songFile,
-      },
-    ];
-
-    if (projectData.songIllustration) {
-      entries.push({
-        name: `${songId}.${getFileExtension(projectData.songIllustration)}`,
-        data: projectData.songIllustration,
+    try {
+      const { zipBuffer, suggestedName } = await createExportZipInWorker({
+        format: 'dr3-viewer',
+        projectData,
+        notes,
+        bpmChanges,
+        speedChanges,
+        offset,
       });
+      await saveZipData(zipBuffer, suggestedName, 'DR3Viewer');
+    } catch (err) {
+      console.error('DR3Viewer export failed', err);
     }
-
-    const zipBlob = await createZipBlob(entries);
-    await saveZipBlob(zipBlob, `${songId}.${difficulty}.zip`, 'DR3Viewer');
   };
 
   const exportDr3Fp = async () => {
     if (!projectData || !projectData.songFile || hasExportIncompatibleTimeSignature) return;
 
-    const songId = projectData.songId || 'level';
-    const difficulty = projectData.difficulty || '0';
-    const infoText = `${projectData.songName || ''}\n${projectData.songArtist || ''}\n${getFirstBpm()}\n`;
-    const entries = [
-      {
-        name: 'info.txt',
-        data: infoText,
-      },
-      {
-        name: `${difficulty}.txt`,
-        data: getChartText(),
-      },
-      {
-        name: `base.${getFileExtension(projectData.songFile)}`,
-        data: projectData.songFile,
-      },
-    ];
-
-    if (projectData.songIllustration) {
-      entries.push({
-        name: `base.${getFileExtension(projectData.songIllustration)}`,
-        data: projectData.songIllustration,
+    try {
+      const { zipBuffer, suggestedName } = await createExportZipInWorker({
+        format: 'dr3-fp',
+        projectData,
+        notes,
+        bpmChanges,
+        speedChanges,
+        offset,
       });
+      await saveZipData(zipBuffer, suggestedName, 'DR3FP');
+    } catch (err) {
+      console.error('DR3FP export failed', err);
     }
-
-    const zipBlob = await createZipBlob(entries);
-    await saveZipBlob(zipBlob, `${songId}.zip`, 'DR3FP');
   };
 
   const currentId = Math.max(nextNoteIdRef.current - 1, 0);
@@ -2297,6 +2463,36 @@ export default function Editor({
     return getTimeAtBeat(currentMeasureBeat + measureDecimal * currentBeatsPerMeasure, timedBpmChanges);
   };
   const selectedNoteTimepos = selectedSingleNote ? getTimeposFromTime(selectedSingleNote.time) : 0;
+  const currentEditorTimepos = getTimeposFromTime(liveStatsTime);
+  const currentEditorBpm = getActiveChange(liveStatsTime, timedBpmChanges).bpm;
+  const sortedSpeedChanges = [...speedChanges].sort((a, b) => (a.measure - b.measure) || (a.beat - b.beat));
+  const currentEditorSpeed = sortedSpeedChanges.reduce((activeSpeed, change) => (
+      change.measure + change.beat / 4 <= currentEditorTimepos
+        ? change.speedChange
+        : activeSpeed
+    ), 1);
+  const currentEditorDistanceState = sortedSpeedChanges.reduce((distanceState, change) => {
+    const changeTimepos = change.measure + change.beat / 4;
+
+    if (changeTimepos > currentEditorTimepos) {
+      return distanceState;
+    }
+
+    const clampedChangeTimepos = Math.max(distanceState.timepos, changeTimepos);
+    return {
+      distance: distanceState.distance + distanceState.speed * (clampedChangeTimepos - distanceState.timepos),
+      speed: change.speedChange,
+      timepos: clampedChangeTimepos,
+    };
+  }, { distance: 0, speed: 1, timepos: 0 });
+  const currentEditorDistance = currentEditorDistanceState.distance +
+    currentEditorDistanceState.speed * Math.max(0, currentEditorTimepos - currentEditorDistanceState.timepos);
+  const currentEditorCombo = notes.reduce((combo, note) => (
+    note.time <= liveStatsTime ? combo + 1 : combo
+  ), 0);
+  const currentEditorScore = notes.length > 0
+    ? Math.floor((3000000 / notes.length) * currentEditorCombo)
+    : 0;
   const notePropertyInputClass = 'w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none disabled:cursor-not-allowed disabled:border-neutral-800 disabled:bg-neutral-900 disabled:text-neutral-600';
   const emptyCanvasMessage = mode === 'import'
     ? 'Provide the music file in Chart Metadata to start editing this imported chart.'
@@ -2323,6 +2519,7 @@ export default function Editor({
       width: 'width',
       parentId: 'parent ID',
       speed: 'speed',
+      appearMode: 'AppearMode',
     };
     const fieldDetails = changedFields.map(([key, value]) => {
       const typedKey = key as keyof Note;
@@ -2502,6 +2699,10 @@ export default function Editor({
     if (timeDisplayRef.current) {
       timeDisplayRef.current.textContent = formatTime(clampedTime, timedBpmChanges);
     }
+    if (progressBarRef.current && !isDraggingProgress.current) {
+      progressBarRef.current.value = clampedTime.toString();
+    }
+    renderPausedTimelineAtFullFps();
   };
 
   return (
@@ -2517,7 +2718,10 @@ export default function Editor({
           ref={audioRef} 
           src={projectData.audioUrl} 
           onEnded={() => setIsPlaying(false)} 
-          onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+          onLoadedMetadata={(e) => {
+            setDuration(e.currentTarget.duration);
+            applyAudioPlaybackSpeed(e.currentTarget, stateRef.current.playbackSpeed);
+          }}
         />
       )}
 
@@ -2540,7 +2744,6 @@ export default function Editor({
         }}
         formData={formData}
         setFormData={setFormData}
-        mode={mode}
       />
 
       <AnimatePresence>
@@ -2603,13 +2806,16 @@ export default function Editor({
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.2 }}
-            onMouseDown={() => setIsSettingsOpen(false)}
+            onMouseDown={() => {
+              setIsSettingsOpen(false);
+              setIsStatisticsRefreshRateMenuOpen(false);
+            }}
           >
             <motion.div
               role="dialog"
               aria-modal="true"
               aria-labelledby="settings-title"
-              className="flex min-h-[22rem] w-full max-w-md flex-col overflow-hidden rounded-3xl border border-white/10 bg-neutral-950/90 shadow-2xl shadow-black/50"
+              className="flex max-h-[85vh] min-h-[22rem] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-neutral-950/90 shadow-2xl shadow-black/50"
               initial={{ opacity: 0, y: 28, scale: 0.96 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 20, scale: 0.96 }}
@@ -2621,7 +2827,7 @@ export default function Editor({
                 <h2 id="settings-title" className="mt-2 text-2xl font-semibold text-white">Settings</h2>
               </div>
 
-              <div className="flex flex-1 flex-col gap-5 px-6 py-6">
+              <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-6 py-6">
                 <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
                   <div className="mb-5 flex items-center justify-between">
                     <div>
@@ -2687,6 +2893,52 @@ export default function Editor({
                           }`}
                         />
                       </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-white/10 bg-neutral-950/60 p-4">
+                    <div className="mb-3">
+                      <p className="text-sm font-medium text-white">Statistics Refresh Rate</p>
+                      <p className="mt-1 text-xs leading-5 text-neutral-500">
+                        Limit how often live statistics update in the properties window.
+                      </p>
+                    </div>
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setIsStatisticsRefreshRateMenuOpen(current => !current)}
+                        className="flex w-full items-center justify-between rounded-lg border border-white/10 bg-neutral-900 px-3 py-2 text-left font-mono text-sm text-neutral-200 outline-none transition-colors hover:bg-neutral-800 focus:border-indigo-500"
+                        aria-haspopup="menu"
+                        aria-expanded={isStatisticsRefreshRateMenuOpen}
+                      >
+                        <span>{statisticsRefreshRate}</span>
+                        <ChevronRight className={`h-4 w-4 text-neutral-500 transition-transform ${isStatisticsRefreshRateMenuOpen ? 'rotate-90' : ''}`} />
+                      </button>
+                      {isStatisticsRefreshRateMenuOpen && (
+                        <div
+                          className="absolute left-0 right-0 top-full z-50 mt-2 rounded-lg border border-neutral-700 bg-neutral-950 p-1 shadow-2xl shadow-black/40"
+                          role="menu"
+                        >
+                          {STATISTICS_REFRESH_RATE_OPTIONS.map((refreshRate) => (
+                            <button
+                              key={refreshRate}
+                              type="button"
+                              onClick={() => {
+                                setStatisticsRefreshRate(refreshRate);
+                                setIsStatisticsRefreshRateMenuOpen(false);
+                              }}
+                              className={`w-full rounded px-3 py-2 text-left font-mono text-sm transition-colors ${
+                                statisticsRefreshRate === refreshRate
+                                  ? 'bg-indigo-500/20 text-indigo-200'
+                                  : 'text-neutral-200 hover:bg-neutral-800'
+                              }`}
+                              role="menuitem"
+                            >
+                              {refreshRate}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </section>
@@ -2755,7 +3007,75 @@ export default function Editor({
 
               <div className="border-t border-white/10 p-4">
                 <button
-                  onClick={() => setIsSettingsOpen(false)}
+                  onClick={() => {
+                    setIsSettingsOpen(false);
+                    setIsStatisticsRefreshRateMenuOpen(false);
+                  }}
+                  className="w-full rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-neutral-950 transition-colors hover:bg-neutral-200"
+                >
+                  Close
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+
+        {isHelpOpen && (
+          <motion.div
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-4 backdrop-blur-md"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            onMouseDown={() => setIsHelpOpen(false)}
+          >
+            <motion.div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="hotkeys-title"
+              className="flex max-h-[85vh] min-h-[22rem] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-neutral-950/90 shadow-2xl shadow-black/50"
+              initial={{ opacity: 0, y: 28, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 20, scale: 0.96 }}
+              transition={{ type: 'spring', stiffness: 320, damping: 30 }}
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <div className="border-b border-white/10 bg-gradient-to-br from-neutral-900 to-neutral-950 px-6 py-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.3em] text-neutral-500">Editor</p>
+                <h2 id="hotkeys-title" className="mt-2 text-2xl font-semibold text-white">Hotkeys</h2>
+              </div>
+
+              <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-6 py-6">
+                {EDITOR_KEYBIND_GROUPS.map(group => (
+                  <section key={group.title} className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+                    <h3 className="mb-4 text-sm font-semibold text-white">{group.title}</h3>
+                    <div className="space-y-3">
+                      {group.bindings.map(binding => (
+                        <div
+                          key={`${group.title}-${binding.keys.join('-')}`}
+                          className="grid gap-3 rounded-2xl border border-white/10 bg-neutral-950/60 p-4 sm:grid-cols-[13rem_minmax(0,1fr)]"
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            {binding.keys.map((key, index) => (
+                              <React.Fragment key={key}>
+                                {index > 0 && <span className="text-xs text-neutral-600">+</span>}
+                                <kbd className="rounded-lg border border-white/10 bg-neutral-900 px-2 py-1 font-mono text-xs font-semibold text-neutral-200 shadow-inner shadow-black/30">
+                                  {key}
+                                </kbd>
+                              </React.Fragment>
+                            ))}
+                          </div>
+                          <p className="text-sm leading-6 text-neutral-300">{binding.description}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
+
+              <div className="border-t border-white/10 p-4">
+                <button
+                  onClick={() => setIsHelpOpen(false)}
                   className="w-full rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-neutral-950 transition-colors hover:bg-neutral-200"
                 >
                   Close
@@ -2835,6 +3155,57 @@ export default function Editor({
               </div>
             </>
           )}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                setIsExportMenuOpen(false);
+                setIsPlaybackSpeedMenuOpen(current => !current);
+              }}
+              className="min-w-14 rounded-lg px-2 py-1.5 font-mono text-sm text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-white"
+              title="Playback speed"
+              aria-haspopup="menu"
+              aria-expanded={isPlaybackSpeedMenuOpen}
+            >
+              {formatPlaybackSpeed(playbackSpeed)}
+            </button>
+            {isPlaybackSpeedMenuOpen && (
+              <div
+                className="absolute right-0 top-full z-50 mt-2 w-24 rounded-lg border border-neutral-700 bg-neutral-950 p-1 shadow-2xl shadow-black/40"
+                role="menu"
+              >
+                {PLAYBACK_SPEED_OPTIONS.map(speed => (
+                  <button
+                    key={speed}
+                    type="button"
+                    onClick={() => changePlaybackSpeed(speed)}
+                    className={`w-full rounded px-3 py-2 text-right font-mono text-sm transition-colors ${
+                      playbackSpeed === speed
+                        ? 'bg-indigo-500/20 text-indigo-200'
+                        : 'text-neutral-200 hover:bg-neutral-800'
+                    }`}
+                    role="menuitem"
+                  >
+                    {formatPlaybackSpeed(speed)}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              openHelp();
+            }}
+            className="p-2 hover:bg-neutral-800 rounded-lg transition-colors text-neutral-400 hover:text-white"
+            title="Hotkeys"
+            aria-label="Open hotkeys help"
+            aria-haspopup="dialog"
+            aria-expanded={isHelpOpen}
+          >
+            <HelpCircle className="w-4 h-4" />
+          </button>
           <button
             type="button"
             onPointerDown={(e) => {
@@ -3416,6 +3787,28 @@ export default function Editor({
                       }}
                     />
                   </label>
+
+                  <label className="block">
+                    <span className="mb-1 block text-xs text-neutral-400">AppearMode</span>
+                    <select
+                      value={selectedSingleNote.appearMode ?? 'none'}
+                      className={notePropertyInputClass}
+                      onChange={(e) => {
+                        const nextAppearMode = e.target.value;
+                        updateSelectedNote({
+                          appearMode: nextAppearMode === 'none'
+                            ? undefined
+                            : nextAppearMode as Note['appearMode'],
+                        });
+                      }}
+                    >
+                      {APPEAR_MODE_OPTIONS.map((appearMode) => (
+                        <option key={appearMode} value={appearMode}>
+                          {appearMode}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                 </div>
               ) : (
                 selectedNoteIds.length > 1 ? (
@@ -3437,7 +3830,7 @@ export default function Editor({
                     <div className="text-sm font-medium text-neutral-200">Chart Summary</div>
                     <div className="mt-3 flex flex-col divide-y divide-neutral-800 text-sm">
                       <div className="flex items-center justify-between py-2 first:pt-0">
-                        <span className="text-neutral-400">Notes</span>
+                        <span className="text-neutral-400">Total Notes</span>
                         <span className="font-mono text-neutral-100">{notes.length}</span>
                       </div>
                       <div className="flex items-center justify-between py-2">
@@ -3448,10 +3841,27 @@ export default function Editor({
                         <span className="text-neutral-400">Speed Changes</span>
                         <span className="font-mono text-neutral-100">{speedChanges.length}</span>
                       </div>
+                      <div className="mt-2 flex items-center justify-between border-t border-neutral-800 py-2 pt-4">
+                        <span className="text-neutral-400">Current BPM</span>
+                        <span className="font-mono text-neutral-100">{formatHistoryNumber(currentEditorBpm)}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-2 last:pb-0">
+                        <span className="text-neutral-400">Current Speed</span>
+                        <span className="font-mono text-neutral-100">{formatHistoryNumber(currentEditorSpeed)}x</span>
+                      </div>
+                      <div className="flex items-center justify-between py-2 last:pb-0">
+                        <span className="text-neutral-400">Current Distance</span>
+                        <span className="font-mono text-neutral-100">{currentEditorDistance.toFixed(3)}</span>
+                      </div>
+                      <div className="mt-2 flex items-center justify-between border-t border-neutral-800 py-2 pt-4">
+                        <span className="text-neutral-400">Current Combo</span>
+                        <span className="font-mono text-neutral-100">{currentEditorCombo}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-2 last:pb-0">
+                        <span className="text-neutral-400">Current Score</span>
+                        <span className="font-mono text-neutral-100">{currentEditorScore}</span>
+                      </div>
                     </div>
-                    <p className="mt-3 border-t border-neutral-800 pt-3 text-xs leading-5 text-neutral-500">
-                      Control + left-click a note to edit its properties.
-                    </p>
                   </div>
                 )
               )}

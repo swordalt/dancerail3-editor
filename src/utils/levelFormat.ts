@@ -17,6 +17,7 @@ const DEFAULT_BPM_CHANGE: BpmChange = {
 };
 
 const TIMEPOS_PRECISION = 1000;
+const APPEAR_MODES = new Set(['L', 'R', 'H', 'P']);
 
 const parseIndexedNumericValue = (line: string, prefix: string) => {
   const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -103,6 +104,10 @@ export function parseLevelText(text: string): ParsedLevelData {
     const width = parseFloat(columns[4]);
     const speed = columns[5].replace(/\s+/g, '');
     const parsedParentId = parseInt(columns[6], 10);
+    const importedAppearMode = columns[7]?.trim().toUpperCase();
+    const appearMode = importedAppearMode && APPEAR_MODES.has(importedAppearMode)
+      ? importedAppearMode as Note['appearMode']
+      : undefined;
 
     if ([id, type, beatPos, lane, width, parsedParentId].some((value) => Number.isNaN(value)) || speed === '') {
       continue;
@@ -134,6 +139,7 @@ export function parseLevelText(text: string): ParsedLevelData {
       width,
       speed,
       parentId: parsedParentId >= 0 ? parsedParentId : null,
+      appearMode,
     });
   }
 
@@ -159,7 +165,7 @@ export function buildLevelText(params: {
   speedChanges: SpeedChange[];
   offset: string | number;
 }): string {
-  const { projectData, notes, bpmChanges, speedChanges, offset } = params;
+  const { notes, bpmChanges, speedChanges, offset } = params;
   const formatNoteValue = (value: number) => Number(value.toFixed(3)).toString();
   const getSerializedParentId = (note: Note) => (HOLD_START_TYPES.includes(note.type) ? 0 : (note.parentId ?? 0));
   const getSerializedSpeed = (note: Note) => {
@@ -212,7 +218,10 @@ export function buildLevelText(params: {
     }
 
     const beatInMeasure = totalBeats - currentMeasureBeat;
-    content += `<${note.id}><${note.type}><${(measureCount + beatInMeasure / currentBeatsPerMeasure).toFixed(3)}><${formatNoteValue(note.lane * 2)}><${formatNoteValue(note.width)}><${getSerializedSpeed(note)}><${getSerializedParentId(note)}>\n`;
+    const serializedAppearMode = note.appearMode && APPEAR_MODES.has(note.appearMode)
+      ? `<${note.appearMode}>`
+      : '';
+    content += `<${note.id}><${note.type}><${(measureCount + beatInMeasure / currentBeatsPerMeasure).toFixed(3)}><${formatNoteValue(note.lane * 2)}><${formatNoteValue(note.width)}><${getSerializedSpeed(note)}><${getSerializedParentId(note)}>${serializedAppearMode}\n`;
   });
 
   return content;

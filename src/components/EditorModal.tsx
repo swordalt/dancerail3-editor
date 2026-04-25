@@ -1,7 +1,7 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { X } from 'lucide-react';
-import type { EditorFormData, EditorMode } from '../types/editorTypes';
+import type { EditorFormData } from '../types/editorTypes';
 
 interface EditorModalProps {
   isOpen: boolean;
@@ -9,10 +9,9 @@ interface EditorModalProps {
   onConfirm: () => void;
   formData: EditorFormData;
   setFormData: (data: EditorFormData) => void;
-  mode?: EditorMode;
 }
 
-export default function EditorModal({ isOpen, onClose, onConfirm, formData, setFormData, mode }: EditorModalProps) {
+export default function EditorModal({ isOpen, onClose, onConfirm, formData, setFormData }: EditorModalProps) {
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   const handleUploadClick = () => {
