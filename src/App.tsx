@@ -11,20 +11,16 @@ const EXAMPLES = [
   {
     id: 'poppy',
     label: 'Poppy - Tier11 [Official]',
+    projectUrl: 'https://raw.githubusercontent.com/swordalt/dancerail3-editor/refs/heads/example-projects/poppy.zip',
+    fileName: 'poppy.zip',
     difficulty: '11',
-    levelUrl: new URL('../example/poppy/poppy.11.txt', import.meta.url).href,
-    audioUrl: new URL('../example/poppy/poppy.ogg', import.meta.url).href,
-    infoUrl: new URL('../example/poppy/info.txt', import.meta.url).href,
-    audioFileName: 'poppy.ogg',
   },
   {
     id: 'galaxycollapse',
     label: 'Galaxy Collapse - Tier20 [Official]',
+    projectUrl: 'https://raw.githubusercontent.com/swordalt/dancerail3-editor/refs/heads/example-projects/galaxycollapse.zip',
+    fileName: 'galaxycollapse.zip',
     difficulty: '20',
-    levelUrl: new URL('../example/galaxycollapse/galaxycollapse.txt', import.meta.url).href,
-    audioUrl: new URL('../example/galaxycollapse/galaxycollapse.mp3', import.meta.url).href,
-    infoUrl: new URL('../example/galaxycollapse/info.txt', import.meta.url).href,
-    audioFileName: 'galaxycollapse.mp3',
   },
 ] as const;
 const AUDIO_EXTENSIONS = new Set(['aac', 'flac', 'm4a', 'mp3', 'ogg', 'wav', 'webm']);
@@ -124,7 +120,9 @@ export default function App() {
     alert('Some files could not be imported automatically. Please import or manage the files yourself in Chart Metadata.');
   };
 
-  const handleZipImport = async (file: File) => {
+  const handleZipImport = async (file: File, options: { difficulty?: string; showImportNotice?: boolean } = {}) => {
+    const { difficulty, showImportNotice = true } = options;
+
     try {
       const { default: JSZip } = await import('jszip');
       const zip = await JSZip.loadAsync(file);
@@ -150,8 +148,11 @@ export default function App() {
         isMissingRequiredFile;
 
       if (!chartFile) {
-        showZipImportNotice();
-        return;
+        if (showImportNotice) {
+          showZipImportNotice();
+          return;
+        }
+        throw new Error('No chart file found in ZIP.');
       }
 
       const chartText = await chartFile.entry.async('text');
@@ -196,7 +197,7 @@ export default function App() {
           songName: infoTitle || songId,
           songArtist: infoArtist,
           songBpm: bpm.toString(),
-          difficulty: inferredDifficulty || '0',
+          difficulty: difficulty || inferredDifficulty || '0',
           songFile: audioFile,
           songIllustration: imageFile,
           bpm,
@@ -208,12 +209,16 @@ export default function App() {
 
       setView({ page: 'editor', mode: 'import' });
 
-      if (shouldShowNotice) {
+      if (showImportNotice && shouldShowNotice) {
         window.setTimeout(showZipImportNotice, 0);
       }
     } catch (error) {
       console.error(error);
-      showZipImportNotice();
+      if (showImportNotice) {
+        showZipImportNotice();
+        return;
+      }
+      throw error;
     }
   };
 
@@ -248,53 +253,23 @@ export default function App() {
     setIsExampleLoading(true);
 
     try {
-      const [levelResponse, infoResponse, audioResponse] = await Promise.all([
-        fetch(example.levelUrl),
-        fetch(example.infoUrl),
-        fetch(example.audioUrl),
-      ]);
+      const response = await fetch(example.projectUrl);
 
-      if (!levelResponse.ok) {
-        throw new Error(`Unable to load example chart: ${levelResponse.status}`);
-      }
-      if (!infoResponse.ok) {
-        throw new Error(`Unable to load example metadata: ${infoResponse.status}`);
-      }
-      if (!audioResponse.ok) {
-        throw new Error(`Unable to load example audio: ${audioResponse.status}`);
+      if (!response.ok) {
+        throw new Error(`Unable to load example project: ${response.status}`);
       }
 
-      const [text, infoText, audioBlob] = await Promise.all([
-        levelResponse.text(),
-        infoResponse.text(),
-        audioResponse.blob(),
-      ]);
-      const [exampleName = 'Poppy', exampleArtist = ''] = infoText
-        .split(/\r?\n/)
-        .map((line) => line.trim());
-      const parsedLevel = parseLevelText(text);
-      const nextBpmChanges = parsedLevel.bpmChanges.length > 0 ? parsedLevel.bpmChanges : getDefaultBpmChanges();
-      const nextSpeedChanges = parsedLevel.speedChanges.length > 0 ? parsedLevel.speedChanges : getDefaultSpeedChanges();
-      const exampleBpm = nextBpmChanges[0]?.bpm || 120;
-      const exampleAudioFile = new File([audioBlob], example.audioFileName, { type: audioBlob.type || getMimeType(getFileExtension(example.audioFileName)) });
+      const projectBlob = await response.blob();
+      const projectFile = new File(
+        [projectBlob],
+        example.fileName,
+        { type: projectBlob.type || 'application/zip' },
+      );
 
-      setNotes(parsedLevel.notes);
-      setBpmChanges(nextBpmChanges);
-      setSpeedChanges(nextSpeedChanges);
-      setOffset(parsedLevel.offset);
-      setInitialProjectData({
-        chartFormat: 'Official',
-        songId: example.id,
-        songName: exampleName || example.label,
-        songArtist: exampleArtist,
-        songBpm: exampleBpm.toString(),
+      await handleZipImport(projectFile, {
         difficulty: example.difficulty,
-        songFile: exampleAudioFile,
-        songIllustration: null,
-        bpm: exampleBpm,
-        audioUrl: example.audioUrl,
+        showImportNotice: false,
       });
-      setView({ page: 'editor', mode: 'import' });
     } catch (error) {
       console.error(error);
       alert('The example project could not be loaded.');

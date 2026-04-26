@@ -63,7 +63,7 @@ export const getNoteBeatEntriesInRange = (
 };
 
 const getNoteIdGroupKey = (note: Note, noteBeat: number) => {
-  const centerPosition = note.lane + note.width / 4;
+  const centerPosition = note.lane + note.width / 2;
   return `${noteBeat.toFixed(6)}:${centerPosition.toFixed(6)}`;
 };
 

@@ -57,7 +57,51 @@ const SELECTION_TYPE_LABELS: Record<SelectionType, string> = {
 };
 const SIDE_PANEL_TRANSITION_MS = 300;
 const LANE_COUNT = 8;
+const X_POSITION_COUNT = LANE_COUNT * 2;
 const SNAP_EPSILON = 0.000001;
+
+const getTierBadge = (difficulty?: string) => {
+  const difficultyText = difficulty?.trim() || '';
+  const difficultyValue = Number.parseInt(difficultyText, 10);
+  const tier = Number.isFinite(difficultyValue) ? Math.max(0, difficultyValue) : 0;
+  const label = tier === 0 ? 'Tier ?' : `Tier ${difficultyText || tier}`;
+
+  if (tier >= 21) {
+    return {
+      label,
+      className: 'border-neutral-500/70 bg-black text-white',
+    };
+  }
+  if (tier >= 16) {
+    return {
+      label,
+      className: 'border-purple-400/50 bg-purple-600 text-white',
+    };
+  }
+  if (tier >= 11) {
+    return {
+      label,
+      className: 'border-red-400/50 bg-red-600 text-white',
+    };
+  }
+  if (tier >= 6) {
+    return {
+      label,
+      className: 'border-yellow-300/70 bg-yellow-300 text-yellow-950',
+    };
+  }
+  if (tier >= 1) {
+    return {
+      label,
+      className: 'border-blue-400/50 bg-blue-600 text-white',
+    };
+  }
+
+  return {
+    label,
+    className: 'border-neutral-200 bg-white text-neutral-950',
+  };
+};
 
 const getBeatsPerMeasureAtBeat = (beat: number, timedBpmChanges: TimedBpmChange[]) => {
   const timeAtBeat = getTimeAtBeat(Math.max(0, beat), timedBpmChanges);
@@ -203,7 +247,7 @@ export default function Editor({
   const [gridZoom, setGridZoom] = useState(initialEditorSettings.gridZoom);
   const [isXPositionGridEnabled, setIsXPositionGridEnabled] = useState(initialEditorSettings.isXPositionGridEnabled);
   const [pixelsPerBeat, setPixelsPerBeat] = useState(initialEditorSettings.pixelsPerBeat);
-  const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'speedChanges' | 'curveSC' | 'history' | 'bpmTiming'>('main');
+  const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'speedChanges' | 'organize' | 'history' | 'bpmTiming'>('main');
   const [isLeftPanelCompact, setIsLeftPanelCompact] = useState(false);
   const [isRightPanelCompact, setIsRightPanelCompact] = useState(false);
   const [isLeftPanelContentVisible, setIsLeftPanelContentVisible] = useState(true);
@@ -539,7 +583,7 @@ export default function Editor({
   }, []);
 
   const getNoteHistoryDetail = useCallback((note: Note) => {
-    return `${formatNoteName(note)} #${note.id} at ${formatTime(note.time, timedBpmChanges)}, lane ${formatNoteLane(note.lane)}, width ${formatHistoryNumber(note.width)}`;
+    return `${formatNoteName(note)} #${note.id} at ${formatTime(note.time, timedBpmChanges)}, xpos ${formatNoteLane(note.lane)}, width ${formatHistoryNumber(note.width)}`;
   }, [timedBpmChanges]);
 
   const getTimeposFromTime = useCallback((time: number) => {
@@ -624,7 +668,7 @@ export default function Editor({
       recordOperation({
         category: 'note',
         title: 'Moved note',
-        detail: `#${dragStartNote.id} from ${formatTime(dragStartNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragStartNote.lane)} to ${formatTime(dragEndNote.time, timedBpmChanges)}, lane ${formatNoteLane(dragEndNote.lane)}`,
+        detail: `#${dragStartNote.id} from ${formatTime(dragStartNote.time, timedBpmChanges)}, xpos ${formatNoteLane(dragStartNote.lane)} to ${formatTime(dragEndNote.time, timedBpmChanges)}, xpos ${formatNoteLane(dragEndNote.lane)}`,
       });
     }
 
@@ -1174,7 +1218,7 @@ export default function Editor({
             id: nextId,
             time: getTimeFromTimepos(pasteTimepos + copiedTimepos - baseTimepos),
             lane: shouldMirrorPaste
-              ? Math.max(0, Math.min(LANE_COUNT - note.width / 2, LANE_COUNT - note.lane - note.width / 2))
+              ? Math.max(0, Math.min(X_POSITION_COUNT - note.width, X_POSITION_COUNT - note.lane - note.width))
               : note.lane,
             parentId: nextParentId,
           };
@@ -1689,11 +1733,12 @@ export default function Editor({
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
       const parentY = hitLineY - (parentBeat - currentBeat) * pixelsPerBeat;
 
-      const noteWidthPx = (laneWidth / 2) * note.width;
-      const parentWidthPx = (laneWidth / 2) * parentNote.width;
-      const noteLeftX = startX + note.lane * laneWidth + 2;
+      const xPositionWidth = laneWidth / 2;
+      const noteWidthPx = xPositionWidth * note.width;
+      const parentWidthPx = xPositionWidth * parentNote.width;
+      const noteLeftX = startX + note.lane * xPositionWidth + 2;
       const noteRightX = noteLeftX + noteWidthPx - 4;
-      const parentLeftX = startX + parentNote.lane * laneWidth + 2;
+      const parentLeftX = startX + parentNote.lane * xPositionWidth + 2;
       const parentRightX = parentLeftX + parentWidthPx - 4;
 
       ctx.fillStyle = getConnectorFill(note.type);
@@ -1722,8 +1767,9 @@ export default function Editor({
 
       const y = hitLineY - (renderedNoteBeat - currentBeat) * pixelsPerBeat;
 
-      const x = startX + renderedNote.lane * laneWidth;
-      const notePixelWidth = (laneWidth / 2) * renderedNote.width;
+      const xPositionWidth = laneWidth / 2;
+      const x = startX + renderedNote.lane * xPositionWidth;
+      const notePixelWidth = xPositionWidth * renderedNote.width;
       const noteCenterX = x + notePixelWidth / 2;
         
       const noteTypeInfo = NOTE_TYPES[renderedNote.type] || UNKNOWN_NOTE_TYPE;
@@ -1811,8 +1857,9 @@ export default function Editor({
       const previewY = hitLineY - (previewBeat - currentBeat) * pixelsPerBeat;
 
       if (previewY > -50 && previewY < height + 50) {
-        const previewX = startX + hoverPreview.lane * laneWidth;
-        const previewPixelWidth = (laneWidth / 2) * noteWidth;
+        const xPositionWidth = laneWidth / 2;
+        const previewX = startX + hoverPreview.lane * xPositionWidth;
+        const previewPixelWidth = xPositionWidth * noteWidth;
         const previewCenterX = previewX + previewPixelWidth / 2;
         const previewTypeInfo = NOTE_TYPES[selectedNoteType] || UNKNOWN_NOTE_TYPE;
         const pulse = (Math.sin(performance.now() / 220) + 1) / 2;
@@ -2041,13 +2088,15 @@ export default function Editor({
     laneWidth: number,
     laneCount: number,
   ) => {
-    const rawLane = (canvasX - gridStartX) / laneWidth;
+    const xPositionWidth = laneWidth / 2;
+    const rawLane = (canvasX - gridStartX) / xPositionWidth;
+    const xPositionCount = laneCount * 2;
 
     if (isXPositionGridEnabled) {
-      return Math.max(0, Math.min(laneCount - 0.5, Math.round(rawLane * 2) / 2));
+      return Math.max(0, Math.min(xPositionCount - 1, Math.round(rawLane)));
     }
 
-    return Number(Math.max(0, Math.min(laneCount, rawLane)).toFixed(3));
+    return Number(Math.max(0, Math.min(xPositionCount, rawLane)).toFixed(3));
   };
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -2092,8 +2141,9 @@ export default function Editor({
       clickBeat + noteHitPaddingBeats,
     ).map(({ note, beat: noteBeat }) => {
       const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
-      const noteStartX = startX + note.lane * laneWidth;
-      const noteEndX = noteStartX + (laneWidth / 2) * note.width;
+      const xPositionWidth = laneWidth / 2;
+      const noteStartX = startX + note.lane * xPositionWidth;
+      const noteEndX = noteStartX + xPositionWidth * note.width;
       return clickX >= noteStartX && clickX <= noteEndX && clickY >= noteY - 10 && clickY <= noteY + 10
         ? note
         : null;
@@ -2310,8 +2360,9 @@ export default function Editor({
           maxBeat,
         ).map(({ note: n, beat: noteBeat }) => {
           const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
-          const noteStartX = startX + n.lane * laneWidth;
-          const noteEndX = noteStartX + (laneWidth / 2) * n.width;
+          const xPositionWidth = laneWidth / 2;
+          const noteStartX = startX + n.lane * xPositionWidth;
+          const noteEndX = noteStartX + xPositionWidth * n.width;
           const noteTopY = noteY - 10;
           const noteBottomY = noteY + 10;
           
@@ -2452,6 +2503,81 @@ export default function Editor({
     }
   };
 
+  const handleOrganizeNotes = () => {
+    const pendingUpdate = pendingDragUpdateRef.current;
+    const sourceNotes = stateRef.current.notes.map(note => (
+      pendingUpdate && note.id === pendingUpdate.noteId
+        ? { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane }
+        : note
+    ));
+
+    if (sourceNotes.length === 0) {
+      return;
+    }
+
+    if (dragUpdateFrameRef.current) {
+      cancelAnimationFrame(dragUpdateFrameRef.current);
+      dragUpdateFrameRef.current = undefined;
+    }
+
+    const sortedNotes = sourceNotes
+      .map((note, originalIndex) => ({
+        note,
+        originalIndex,
+        timepos: getTimeposFromTime(note.time),
+      }))
+      .sort((a, b) => (
+        (a.timepos - b.timepos)
+        || (a.note.lane - b.note.lane)
+        || (a.note.id - b.note.id)
+        || (a.originalIndex - b.originalIndex)
+      ));
+    const nextIdByOriginalId = new Map<number, number>();
+
+    sortedNotes.forEach(({ note }, index) => {
+      nextIdByOriginalId.set(note.id, index + 1);
+    });
+
+    const organizedNotes = sourceNotes.map(note => ({
+      ...note,
+      id: nextIdByOriginalId.get(note.id) ?? note.id,
+      parentId: note.parentId === null
+        ? null
+        : nextIdByOriginalId.get(note.parentId) ?? note.parentId,
+    }));
+    const changedCount = organizedNotes.reduce((count, note, index) => {
+      const previousNote = sourceNotes[index];
+      return count + (note.id !== previousNote.id || note.parentId !== previousNote.parentId ? 1 : 0);
+    }, 0);
+
+    setNotes(organizedNotes);
+    setSelectedNoteIds(prev => prev
+      .map(id => nextIdByOriginalId.get(id))
+      .filter((id): id is number => id !== undefined));
+    setDraggingNoteId(null);
+    setSelectionBox(null);
+    setHoverPreview(null);
+    pendingDragUpdateRef.current = null;
+    dragStartNoteRef.current = null;
+    renderPausedTimelineAtFullFps();
+
+    if (currentParentInput.trim() !== '') {
+      const currentParentId = parseInt(currentParentInput, 10);
+      if (!Number.isNaN(currentParentId)) {
+        const nextParentId = nextIdByOriginalId.get(currentParentId);
+        setCurrentParentInput(nextParentId === undefined ? '' : nextParentId.toString());
+      }
+    }
+
+    recordOperation({
+      category: 'note',
+      title: 'Organized notes',
+      detail: changedCount === 0
+        ? `${sourceNotes.length} notes were already in time/xpos order`
+        : `Reassigned ${sourceNotes.length} note IDs by timepos, xpos, then original ID`,
+    });
+  };
+
   const currentId = Math.max(nextNoteIdRef.current - 1, 0);
   const currentParentId =
     currentParentInput.trim() === '' ? currentId : parseInt(currentParentInput, 10);
@@ -2552,7 +2678,7 @@ export default function Editor({
 
     const fieldLabels: Partial<Record<keyof Note, string>> = {
       time: 'time',
-      lane: 'lane',
+      lane: 'xpos',
       type: 'type',
       width: 'width',
       parentId: 'parent ID',
@@ -2703,6 +2829,8 @@ export default function Editor({
       });
     }
   };
+
+  const tierBadge = getTierBadge(projectData?.difficulty);
 
   const jumpToNoteTime = (time: number) => {
     if (stateRef.current.isPlaying) {
@@ -3183,6 +3311,11 @@ export default function Editor({
           <div className="h-4 w-px bg-neutral-800" />
           <div className="flex min-w-0 items-center gap-2">
             <h1 className="min-w-0 truncate text-sm font-medium">{projectData?.songName || 'Untitled Project'}</h1>
+            {projectData && (
+              <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${tierBadge.className}`}>
+                {tierBadge.label}
+              </span>
+            )}
             <span className="shrink-0 rounded-full border border-indigo-400/30 bg-indigo-500/10 px-2 py-0.5 text-[11px] font-semibold text-indigo-200">
               {projectData?.chartFormat ?? 'Official'}
             </span>
@@ -3426,7 +3559,7 @@ export default function Editor({
                   />
                   <div className="text-xs text-neutral-400 mt-2">
                     {currentParentNote
-                      ? `ID ${currentParentNote.id} | Lane ${currentParentNote.lane + 1} | Type ${NOTE_TYPES[currentParentNote.type]?.name || currentParentNote.type}`
+                      ? `ID ${currentParentNote.id} | XPos ${formatNoteLane(currentParentNote.lane)} | Type ${NOTE_TYPES[currentParentNote.type]?.name || currentParentNote.type}`
                       : currentParentInput.trim() === ''
                         ? 'Auto-select current ID when placing.'
                         : 'No note exists with that ID.'}
@@ -3801,16 +3934,16 @@ export default function Editor({
                   </label>
 
                   <label className="block">
-                    <span className="mb-1 block text-xs text-neutral-400">Lane</span>
+                    <span className="mb-1 block text-xs text-neutral-400">XPos</span>
                     <CommitInput
                       type="number"
-                      min="1"
-                      max="8"
+                      min="0"
+                      max="16"
                       step="0.01"
-                      value={selectedSingleNote.lane + 1}
+                      value={selectedSingleNote.lane}
                       className={notePropertyInputClass}
                       onCommit={(value) => {
-                        const lane = Math.max(1, Math.min(8, Number(value) || 1)) - 1;
+                        const lane = Math.max(0, Math.min(X_POSITION_COUNT, Number(value) || 0));
                         updateSelectedNote({ lane });
                       }}
                     />

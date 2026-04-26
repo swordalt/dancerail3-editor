@@ -92,7 +92,7 @@ export function parseLevelText(text: string): ParsedLevelData {
     const id = parseInt(columns[0], 10);
     const type = parseInt(columns[1], 10);
     const beatPos = parseFloat(columns[2]);
-    const lane = parseFloat(columns[3]) / 2;
+    const lane = parseFloat(columns[3]);
     const width = parseFloat(columns[4]);
     const speed = columns[5].replace(/\s+/g, '');
     const parsedParentId = parseInt(columns[6], 10);
@@ -213,7 +213,7 @@ export function buildLevelText(params: {
     const serializedAppearMode = note.appearMode && APPEAR_MODES.has(note.appearMode)
       ? `<${note.appearMode}>`
       : '';
-    content += `<${note.id}><${note.type}><${(measureCount + beatInMeasure / currentBeatsPerMeasure).toFixed(3)}><${formatNoteValue(note.lane * 2)}><${formatNoteValue(note.width)}><${getSerializedSpeed(note)}><${getSerializedParentId(note)}>${serializedAppearMode}\n`;
+    content += `<${note.id}><${note.type}><${(measureCount + beatInMeasure / currentBeatsPerMeasure).toFixed(3)}><${formatNoteValue(note.lane)}><${formatNoteValue(note.width)}><${getSerializedSpeed(note)}><${getSerializedParentId(note)}>${serializedAppearMode}\n`;
   });
 
   return content;

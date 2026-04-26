@@ -59,7 +59,7 @@ export const formatMaybeValue = (value: unknown) => (
 
 export const formatNoteName = (note: Note) => NOTE_TYPES[note.type]?.name || `Type ${note.type}`;
 
-export const formatNoteLane = (lane: number) => formatHistoryNumber(lane + 1);
+export const formatNoteLane = (lane: number) => formatHistoryNumber(lane);
 
 export const formatTimingPosition = (timepos: number) => `Timepos ${formatHistoryNumber(timepos)}`;
 
