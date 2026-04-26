@@ -1,4 +1,5 @@
 export type EditorMode = 'new' | 'import';
+export type ChartFormat = 'Official' | 'DR3Custom';
 
 export interface ViewState {
   page: 'landing' | 'editor';
@@ -52,6 +53,7 @@ export interface EditorFormData {
 }
 
 export interface ProjectData extends EditorFormData {
+  chartFormat: ChartFormat;
   bpm: number;
   audioUrl: string;
 }

@@ -10,7 +10,7 @@ const DEFAULT_SPEED_CHANGES: SpeedChange[] = [{ timepos: 0, speedChange: 1 }];
 const EXAMPLES = [
   {
     id: 'poppy',
-    label: 'Poppy - Tier11',
+    label: 'Poppy - Tier11 [Official]',
     difficulty: '11',
     levelUrl: new URL('../example/poppy/poppy.11.txt', import.meta.url).href,
     audioUrl: new URL('../example/poppy/poppy.ogg', import.meta.url).href,
@@ -19,7 +19,7 @@ const EXAMPLES = [
   },
   {
     id: 'galaxycollapse',
-    label: 'Galaxy Collapse - Tier20',
+    label: 'Galaxy Collapse - Tier20 [Official]',
     difficulty: '20',
     levelUrl: new URL('../example/galaxycollapse/galaxycollapse.txt', import.meta.url).href,
     audioUrl: new URL('../example/galaxycollapse/galaxycollapse.mp3', import.meta.url).href,
@@ -191,6 +191,7 @@ export default function App() {
         const bpm = parseFloat(infoBpm) || firstBpm;
 
         setInitialProjectData({
+          chartFormat: 'Official',
           songId,
           songName: infoTitle || songId,
           songArtist: infoArtist,
@@ -282,6 +283,7 @@ export default function App() {
       setSpeedChanges(nextSpeedChanges);
       setOffset(parsedLevel.offset);
       setInitialProjectData({
+        chartFormat: 'Official',
         songId: example.id,
         songName: exampleName || example.label,
         songArtist: exampleArtist,

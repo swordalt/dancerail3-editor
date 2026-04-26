@@ -1,6 +1,6 @@
 import React from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ChevronDown, FilePlus, Upload } from 'lucide-react';
+import { Ban, ChevronDown, FilePlus, FileText, Upload, X } from 'lucide-react';
 
 interface ExampleOption {
   id: string;
@@ -27,10 +27,16 @@ export default function LandingPage({
   isExampleLoading = false,
 }: LandingPageProps) {
   const [isExampleMenuOpen, setIsExampleMenuOpen] = React.useState(false);
+  const [isFormatModalOpen, setIsFormatModalOpen] = React.useState(false);
 
   const handleExampleSelect = (exampleId: string) => {
     setIsExampleMenuOpen(false);
     onExampleSelect(exampleId);
+  };
+
+  const handleOfficialCreate = () => {
+    setIsFormatModalOpen(false);
+    onCreateProject();
   };
 
   return (
@@ -67,13 +73,13 @@ export default function LandingPage({
             DanceRail3 <span className="text-indigo-400">Editor</span>
           </h1>
           <p className="text-lg text-neutral-400 max-w-md mx-auto">
-            A modern, performant chart editor for creating and modifying DanceRail3 levels.
+            A versatile chart maker and editor for the rhythm game DanceRail3. Only supports widescreen devices.
           </p>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 w-full max-w-lg">
           <motion.button
-            onClick={onCreateProject}
+            onClick={() => setIsFormatModalOpen(true)}
             whileHover={{ scale: 1.02, y: -2 }}
             whileTap={{ scale: 0.98 }}
             className="group relative flex flex-col items-center justify-center p-8 bg-neutral-900 border border-neutral-800 rounded-2xl hover:border-indigo-500/50 hover:bg-neutral-800/50 transition-colors overflow-hidden cursor-pointer"
@@ -81,7 +87,7 @@ export default function LandingPage({
             <div className="absolute inset-0 bg-gradient-to-br from-indigo-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
             <FilePlus className="w-10 h-10 text-indigo-400 mb-4 group-hover:scale-110 transition-transform duration-300" />
             <span className="text-lg font-semibold text-white">New Project</span>
-            <span className="text-sm text-neutral-400 mt-2">Import audio and start charting.</span>
+            <span className="text-sm text-neutral-400 mt-2">Import an audio file and start charting.</span>
           </motion.button>
 
           <motion.button
@@ -93,7 +99,7 @@ export default function LandingPage({
             <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
             <Upload className="w-10 h-10 text-emerald-400 mb-4 group-hover:scale-110 transition-transform duration-300" />
             <span className="text-lg font-semibold text-white">Import Project</span>
-            <span className="text-sm text-neutral-400 mt-2">Import an existing chart zip or data file.</span>
+            <span className="text-sm text-neutral-400 mt-2">Import existing chart data or project.</span>
           </motion.button>
 
           <div className="relative sm:col-span-2">
@@ -108,7 +114,7 @@ export default function LandingPage({
               className="group relative flex h-12 w-full cursor-pointer items-center justify-center gap-2 overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900 px-5 text-sm font-semibold text-white outline-none transition-colors hover:border-sky-500/50 hover:bg-neutral-800/50 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <div className="absolute inset-0 bg-gradient-to-br from-sky-500/10 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
-              <span className="relative">{isExampleLoading ? 'Loading Example...' : 'See Example'}</span>
+              <span className="relative">{isExampleLoading ? 'Loading...' : 'Example Projects'}</span>
               <ChevronDown className={`relative h-4 w-4 text-sky-400 transition-transform duration-200 ${isExampleMenuOpen ? 'rotate-180' : ''}`} />
             </motion.button>
 
@@ -157,6 +163,76 @@ export default function LandingPage({
           />
         </div>
       </motion.div>
+
+      <AnimatePresence>
+        {isFormatModalOpen && (
+          <motion.div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-md"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.18 }}
+            onMouseDown={() => setIsFormatModalOpen(false)}
+          >
+            <motion.div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="chart-format-title"
+              className="w-full max-w-lg overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900 text-left shadow-2xl shadow-black/50"
+              initial={{ opacity: 0, y: 20, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 16, scale: 0.96 }}
+              transition={{ type: 'spring', stiffness: 360, damping: 32 }}
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-center justify-between border-b border-neutral-800 px-6 py-5">
+                <h2 id="chart-format-title" className="text-xl font-bold text-white">
+                  Choose Chart Format
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setIsFormatModalOpen(false)}
+                  aria-label="Close chart format dialog"
+                  className="rounded-lg p-2 text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-white"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="grid gap-3 p-6">
+                <button
+                  type="button"
+                  onClick={handleOfficialCreate}
+                  className="group flex w-full items-center gap-4 rounded-xl border border-indigo-500/40 bg-indigo-500/10 p-4 text-left transition-colors hover:border-indigo-400 hover:bg-indigo-500/15"
+                >
+                  <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-indigo-500/20 text-indigo-300">
+                    <FileText className="h-5 w-5" />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block font-semibold text-white">Official Format</span>
+                    <span className="mt-1 block text-sm text-neutral-400">Use the official DanceRail3 chart format.</span>
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled
+                  aria-disabled="true"
+                  className="flex w-full cursor-not-allowed items-center gap-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4 text-left opacity-55"
+                >
+                  <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-neutral-800 text-neutral-500">
+                    <Ban className="h-5 w-5" />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block font-semibold text-neutral-300">DR3Custom Format</span>
+                    <span className="mt-1 block text-sm text-neutral-500">Not available yet.</span>
+                  </span>
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }

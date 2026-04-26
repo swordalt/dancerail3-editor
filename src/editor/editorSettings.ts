@@ -3,12 +3,15 @@ export const MIN_PIXELS_PER_BEAT = 60;
 export const MAX_PIXELS_PER_BEAT = 320;
 export const EDITOR_SETTINGS_STORAGE_KEY = 'dancerail3-editor:settings';
 export const STATISTICS_REFRESH_RATE_OPTIONS = ['15fps', '30fps', '60fps', 'max'] as const;
+export const SELECTION_TYPE_OPTIONS = ['window', 'crossing'] as const;
 
 export type StatisticsRefreshRate = typeof STATISTICS_REFRESH_RATE_OPTIONS[number];
+export type SelectionType = typeof SELECTION_TYPE_OPTIONS[number];
 
 export interface EditorSettings {
   isExitWarningEnabled: boolean;
   isScrollDirectionInverted: boolean;
+  selectionType: SelectionType;
   statisticsRefreshRate: StatisticsRefreshRate;
   musicVolume: number;
   tapSoundVolume: number;
@@ -21,6 +24,7 @@ export interface EditorSettings {
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   isExitWarningEnabled: true,
   isScrollDirectionInverted: false,
+  selectionType: 'window',
   statisticsRefreshRate: '30fps',
   musicVolume: 1,
   tapSoundVolume: 1,
@@ -56,6 +60,11 @@ const isValidStatisticsRefreshRate = (value: unknown): value is StatisticsRefres
   STATISTICS_REFRESH_RATE_OPTIONS.includes(value as StatisticsRefreshRate)
 );
 
+const isValidSelectionType = (value: unknown): value is SelectionType => (
+  typeof value === 'string' &&
+  SELECTION_TYPE_OPTIONS.includes(value as SelectionType)
+);
+
 export const getStatisticsRefreshIntervalMs = (refreshRate: StatisticsRefreshRate) => {
   if (refreshRate === 'max') {
     return 0;
@@ -81,6 +90,9 @@ export const loadEditorSettings = (): EditorSettings => {
       isScrollDirectionInverted: typeof parsedSettings.isScrollDirectionInverted === 'boolean'
         ? parsedSettings.isScrollDirectionInverted
         : DEFAULT_EDITOR_SETTINGS.isScrollDirectionInverted,
+      selectionType: isValidSelectionType(parsedSettings.selectionType)
+        ? parsedSettings.selectionType
+        : DEFAULT_EDITOR_SETTINGS.selectionType,
       statisticsRefreshRate: isValidStatisticsRefreshRate(parsedSettings.statisticsRefreshRate)
         ? parsedSettings.statisticsRefreshRate
         : DEFAULT_EDITOR_SETTINGS.statisticsRefreshRate,

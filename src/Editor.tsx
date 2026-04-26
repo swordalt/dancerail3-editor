@@ -27,7 +27,9 @@ import {
 import {
   MAX_PIXELS_PER_BEAT,
   MIN_PIXELS_PER_BEAT,
+  SELECTION_TYPE_OPTIONS,
   STATISTICS_REFRESH_RATE_OPTIONS,
+  type SelectionType,
   type StatisticsRefreshRate,
   getStatisticsRefreshIntervalMs,
   loadEditorSettings,
@@ -49,6 +51,10 @@ const AUDIO_CLOCK_HANDOFF_DELAY_MS = 200;
 const AUDIO_CLOCK_SYNC_TOLERANCE_SECONDS = 0.05;
 const AUDIO_SEEK_TIMEOUT_MS = 10000;
 const PLAYBACK_SPEED_OPTIONS = [1, 0.75, 0.5, 0.25, 1.25, 1.5, 1.75, 2] as const;
+const SELECTION_TYPE_LABELS: Record<SelectionType, string> = {
+  window: 'Window Selection',
+  crossing: 'Crossing Selection',
+};
 const SIDE_PANEL_TRANSITION_MS = 300;
 const LANE_COUNT = 8;
 const SNAP_EPSILON = 0.000001;
@@ -185,9 +191,11 @@ export default function Editor({
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [isPlaybackSpeedMenuOpen, setIsPlaybackSpeedMenuOpen] = useState(false);
   const [isStatisticsRefreshRateMenuOpen, setIsStatisticsRefreshRateMenuOpen] = useState(false);
+  const [isSelectionTypeMenuOpen, setIsSelectionTypeMenuOpen] = useState(false);
   const [isExitWarningOpen, setIsExitWarningOpen] = useState(false);
   const [isExitWarningEnabled, setIsExitWarningEnabled] = useState(initialEditorSettings.isExitWarningEnabled);
   const [isScrollDirectionInverted, setIsScrollDirectionInverted] = useState(initialEditorSettings.isScrollDirectionInverted);
+  const [selectionType, setSelectionType] = useState<SelectionType>(initialEditorSettings.selectionType);
   const [statisticsRefreshRate, setStatisticsRefreshRate] = useState<StatisticsRefreshRate>(initialEditorSettings.statisticsRefreshRate);
   const [musicVolume, setMusicVolume] = useState(initialEditorSettings.musicVolume);
   const [tapSoundVolume, setTapSoundVolume] = useState(initialEditorSettings.tapSoundVolume);
@@ -264,6 +272,7 @@ export default function Editor({
     saveEditorSettings({
       isExitWarningEnabled,
       isScrollDirectionInverted,
+      selectionType,
       statisticsRefreshRate,
       musicVolume,
       tapSoundVolume,
@@ -275,6 +284,7 @@ export default function Editor({
   }, [
     isExitWarningEnabled,
     isScrollDirectionInverted,
+    selectionType,
     statisticsRefreshRate,
     musicVolume,
     tapSoundVolume,
@@ -360,6 +370,7 @@ export default function Editor({
     setIsHelpOpen(false);
     setIsPlaybackSpeedMenuOpen(false);
     setIsStatisticsRefreshRateMenuOpen(false);
+    setIsSelectionTypeMenuOpen(false);
     setIsSettingsOpen(true);
   };
 
@@ -367,6 +378,7 @@ export default function Editor({
     setIsSettingsOpen(false);
     setIsPlaybackSpeedMenuOpen(false);
     setIsStatisticsRefreshRateMenuOpen(false);
+    setIsSelectionTypeMenuOpen(false);
     setIsHelpOpen(true);
   };
 
@@ -503,9 +515,10 @@ export default function Editor({
   }, [notes]);
 
   const timedBpmChanges = useMemo(() => convertBpmChangesToTime(bpmChanges), [bpmChanges]);
+  const isOfficialChartFormat = (projectData?.chartFormat ?? 'Official') === 'Official';
   const hasExportIncompatibleTimeSignature = useMemo(
-    () => bpmChanges.some(change => change.timeSignature.trim() !== '4/4'),
-    [bpmChanges],
+    () => !isOfficialChartFormat && bpmChanges.some(change => change.timeSignature.trim() !== '4/4'),
+    [bpmChanges, isOfficialChartFormat],
   );
   const hasRequiredExportMetadata = Boolean(
     projectData?.songId.trim() &&
@@ -668,6 +681,7 @@ export default function Editor({
 
     setProjectData({
       ...formData,
+      chartFormat: projectData?.chartFormat ?? 'Official',
       songBpm: nextBpm.toString(),
       bpm: nextBpm,
       audioUrl
@@ -2286,8 +2300,9 @@ export default function Editor({
         const maxX = Math.max(selectionBox.startX, selectionBox.endX);
         const minY = Math.min(selectionBox.startY, selectionBox.endY);
         const maxY = Math.max(selectionBox.startY, selectionBox.endY);
-        const minBeat = currentBeat + (hitLineY - maxY) / pixelsPerBeat;
-        const maxBeat = currentBeat + (hitLineY - minY) / pixelsPerBeat;
+        const verticalSelectionPaddingBeats = selectionType === 'crossing' ? 10 / pixelsPerBeat : 0;
+        const minBeat = currentBeat + (hitLineY - maxY) / pixelsPerBeat - verticalSelectionPaddingBeats;
+        const maxBeat = currentBeat + (hitLineY - minY) / pixelsPerBeat + verticalSelectionPaddingBeats;
 
         const selected = getNoteBeatEntriesInRange(
           noteRenderIndex.noteBeatEntries,
@@ -2297,8 +2312,16 @@ export default function Editor({
           const noteY = hitLineY - (noteBeat - currentBeat) * pixelsPerBeat;
           const noteStartX = startX + n.lane * laneWidth;
           const noteEndX = noteStartX + (laneWidth / 2) * n.width;
+          const noteTopY = noteY - 10;
+          const noteBottomY = noteY + 10;
           
-          return noteStartX >= minX && noteEndX <= maxX && noteY >= minY && noteY <= maxY
+          if (selectionType === 'crossing') {
+            return noteEndX >= minX && noteStartX <= maxX && noteBottomY >= minY && noteTopY <= maxY
+              ? n
+              : null;
+          }
+
+          return noteStartX >= minX && noteEndX <= maxX && noteTopY >= minY && noteBottomY <= maxY
             ? n
             : null;
         }).filter((note): note is Note => note !== null);
@@ -2505,6 +2528,10 @@ export default function Editor({
     currentEditorScore,
   } = chartStatistics;
   const notePropertyInputClass = 'w-full p-2 text-sm bg-neutral-800 rounded border border-neutral-700 focus:border-indigo-500 outline-none disabled:cursor-not-allowed disabled:border-neutral-800 disabled:bg-neutral-900 disabled:text-neutral-600';
+  const bpmChangeGridClass = isOfficialChartFormat
+    ? 'grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_1.5rem] gap-2'
+    : 'grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.85fr)_1.5rem] gap-2';
+  const changeTableInputClass = 'w-full min-w-0 p-1 bg-neutral-800 rounded border border-neutral-700';
   const emptyCanvasMessage = mode === 'import'
     ? 'Provide the music file in Chart Metadata to start editing this imported chart.'
     : 'Fill in project details in Chart Metadata to start editing.';
@@ -2603,7 +2630,7 @@ export default function Editor({
     const newChange = {
       timepos,
       bpm: lastChange ? lastChange.bpm : 120,
-      timeSignature: lastChange ? lastChange.timeSignature : '4/4',
+      timeSignature: isOfficialChartFormat ? '4/4' : (lastChange ? lastChange.timeSignature : '4/4'),
     };
 
     setBpmChanges([...bpmChanges, newChange]);
@@ -2812,6 +2839,7 @@ export default function Editor({
             onMouseDown={() => {
               setIsSettingsOpen(false);
               setIsStatisticsRefreshRateMenuOpen(false);
+              setIsSelectionTypeMenuOpen(false);
             }}
           >
             <motion.div
@@ -2901,6 +2929,55 @@ export default function Editor({
 
                   <div className="mt-4 rounded-2xl border border-white/10 bg-neutral-950/60 p-4">
                     <div className="mb-3">
+                      <p className="text-sm font-medium text-white">Selection Type</p>
+                      <p className="mt-1 text-xs leading-5 text-neutral-500">
+                        Choose how middle-drag selection boxes collect notes.
+                      </p>
+                    </div>
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsStatisticsRefreshRateMenuOpen(false);
+                          setIsSelectionTypeMenuOpen(current => !current);
+                        }}
+                        className="flex w-full items-center justify-between rounded-lg border border-white/10 bg-neutral-900 px-3 py-2 text-left text-sm text-neutral-200 outline-none transition-colors hover:bg-neutral-800 focus:border-indigo-500"
+                        aria-haspopup="menu"
+                        aria-expanded={isSelectionTypeMenuOpen}
+                      >
+                        <span>{SELECTION_TYPE_LABELS[selectionType]}</span>
+                        <ChevronRight className={`h-4 w-4 text-neutral-500 transition-transform ${isSelectionTypeMenuOpen ? 'rotate-90' : ''}`} />
+                      </button>
+                      {isSelectionTypeMenuOpen && (
+                        <div
+                          className="absolute left-0 right-0 top-full z-50 mt-2 rounded-lg border border-neutral-700 bg-neutral-950 p-1 shadow-2xl shadow-black/40"
+                          role="menu"
+                        >
+                          {SELECTION_TYPE_OPTIONS.map((nextSelectionType) => (
+                            <button
+                              key={nextSelectionType}
+                              type="button"
+                              onClick={() => {
+                                setSelectionType(nextSelectionType);
+                                setIsSelectionTypeMenuOpen(false);
+                              }}
+                              className={`w-full rounded px-3 py-2 text-left text-sm transition-colors ${
+                                selectionType === nextSelectionType
+                                  ? 'bg-indigo-500/20 text-indigo-200'
+                                  : 'text-neutral-200 hover:bg-neutral-800'
+                              }`}
+                              role="menuitem"
+                            >
+                              {SELECTION_TYPE_LABELS[nextSelectionType]}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-white/10 bg-neutral-950/60 p-4">
+                    <div className="mb-3">
                       <p className="text-sm font-medium text-white">Statistics Refresh Rate</p>
                       <p className="mt-1 text-xs leading-5 text-neutral-500">
                         Limit how often live statistics update in the properties window.
@@ -2909,7 +2986,10 @@ export default function Editor({
                     <div className="relative">
                       <button
                         type="button"
-                        onClick={() => setIsStatisticsRefreshRateMenuOpen(current => !current)}
+                        onClick={() => {
+                          setIsSelectionTypeMenuOpen(false);
+                          setIsStatisticsRefreshRateMenuOpen(current => !current);
+                        }}
                         className="flex w-full items-center justify-between rounded-lg border border-white/10 bg-neutral-900 px-3 py-2 text-left font-mono text-sm text-neutral-200 outline-none transition-colors hover:bg-neutral-800 focus:border-indigo-500"
                         aria-haspopup="menu"
                         aria-expanded={isStatisticsRefreshRateMenuOpen}
@@ -3013,6 +3093,7 @@ export default function Editor({
                   onClick={() => {
                     setIsSettingsOpen(false);
                     setIsStatisticsRefreshRateMenuOpen(false);
+                    setIsSelectionTypeMenuOpen(false);
                   }}
                   className="w-full rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-neutral-950 transition-colors hover:bg-neutral-200"
                 >
@@ -3100,7 +3181,12 @@ export default function Editor({
             <ArrowLeft className="w-5 h-5" />
           </button>
           <div className="h-4 w-px bg-neutral-800" />
-          <h1 className="font-medium text-sm truncate">{projectData?.songName || 'Untitled Project'}</h1>
+          <div className="flex min-w-0 items-center gap-2">
+            <h1 className="min-w-0 truncate text-sm font-medium">{projectData?.songName || 'Untitled Project'}</h1>
+            <span className="shrink-0 rounded-full border border-indigo-400/30 bg-indigo-500/10 px-2 py-0.5 text-[11px] font-semibold text-indigo-200">
+              {projectData?.chartFormat ?? 'Official'}
+            </span>
+          </div>
         </div>
         
         {/* Transport */}
@@ -3460,14 +3546,16 @@ export default function Editor({
                   }} />
                 </div>
                 <div className="flex flex-1 min-h-0 flex-col">
-                  <p className="mb-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200">
-                    Export currently only supports BPM changes with 4/4 time signatures.
-                  </p>
+                  {!isOfficialChartFormat && (
+                    <p className="mb-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200">
+                      Export currently only supports BPM changes with 4/4 time signatures.
+                    </p>
+                  )}
                   <label className="block shrink-0 text-xs text-neutral-400 mb-1">BPM Changes</label>
-                  <div className="grid grid-cols-[4.25rem_3rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
+                  <div className={`${bpmChangeGridClass} pb-2 text-left text-sm text-neutral-500`}>
                     <div>Timepos</div>
                     <div>BPM</div>
-                    <div>Sig</div>
+                    {!isOfficialChartFormat && <div>Sig</div>}
                     <div />
                   </div>
                   <VirtualizedChangeList
@@ -3476,17 +3564,19 @@ export default function Editor({
                     getKey={(_, index) => index}
                     className="min-h-0 flex-1 pr-1 text-sm text-neutral-300"
                     renderRow={(change, index, style) => (
-                      <div style={style} className="grid grid-cols-[4.25rem_3rem_3rem_1.5rem] items-center gap-1">
-                        <CommitInput type="number" step="0.001" value={getBpmChangeTimepos(change)} className="w-16 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                      <div style={style} className={`${bpmChangeGridClass} items-center`}>
+                        <CommitInput type="number" step="0.001" value={getBpmChangeTimepos(change)} className={changeTableInputClass} onCommit={(value) => {
                             const timepos = parseFloat(value);
                             updateBpmChange(index, { timepos: Number.isFinite(timepos) ? timepos : 0 });
                           }} />
-                        <CommitInput type="number" value={change.bpm} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                        <CommitInput type="number" value={change.bpm} className={changeTableInputClass} onCommit={(value) => {
                             updateBpmChange(index, { bpm: parseFloat(value) || 120 });
                           }} />
-                        <CommitInput type="text" value={change.timeSignature} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
-                            updateBpmChange(index, { timeSignature: value });
-                          }} />
+                        {!isOfficialChartFormat && (
+                          <CommitInput type="text" value={change.timeSignature} className={changeTableInputClass} onCommit={(value) => {
+                              updateBpmChange(index, { timeSignature: value });
+                            }} />
+                        )}
                         <div>
                           {index > 0 && (
                             <button onClick={() => {
@@ -3514,7 +3604,7 @@ export default function Editor({
                 <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Speed Changes</div>
               </div>
               <div className="flex flex-col overflow-hidden flex-1 pr-1 pb-4 min-h-0">
-                <div className="grid grid-cols-[4.25rem_3rem_1.5rem] gap-1 pb-2 text-left text-sm text-neutral-500">
+                <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_1.5rem] gap-2 pb-2 text-left text-sm text-neutral-500">
                   <div>Timepos</div>
                   <div>Speed</div>
                   <div />
@@ -3522,15 +3612,15 @@ export default function Editor({
                 <VirtualizedChangeList
                   items={speedChanges}
                   rowHeight={36}
-                  getKey={(_, index) => index}
-                  className="min-h-0 flex-1 pr-1 text-sm text-neutral-300"
-                  renderRow={(change, index, style) => (
-                    <div style={style} className="grid grid-cols-[4.25rem_3rem_1.5rem] items-center gap-1">
-                      <CommitInput type="number" step="0.001" value={change.timepos} className="w-16 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                    getKey={(_, index) => index}
+                    className="min-h-0 flex-1 pr-1 text-sm text-neutral-300"
+                    renderRow={(change, index, style) => (
+                    <div style={style} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_1.5rem] items-center gap-2">
+                      <CommitInput type="number" step="0.001" value={change.timepos} className={changeTableInputClass} onCommit={(value) => {
                           const timepos = parseFloat(value);
                           updateSpeedChange(index, { timepos: Number.isFinite(timepos) ? timepos : 0 });
                         }} />
-                      <CommitInput type="number" step="0.1" value={change.speedChange} className="w-12 p-1 bg-neutral-800 rounded border border-neutral-700" onCommit={(value) => {
+                      <CommitInput type="number" step="0.1" value={change.speedChange} className={changeTableInputClass} onCommit={(value) => {
                           const val = parseFloat(value);
                           updateSpeedChange(index, { speedChange: isNaN(val) ? 1 : val });
                         }} />
