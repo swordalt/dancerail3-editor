@@ -248,6 +248,7 @@ export default function Editor({
   const [isXPositionGridEnabled, setIsXPositionGridEnabled] = useState(initialEditorSettings.isXPositionGridEnabled);
   const [pixelsPerBeat, setPixelsPerBeat] = useState(initialEditorSettings.pixelsPerBeat);
   const [activeLeftPanel, setActiveLeftPanel] = useState<'main' | 'editInfo' | 'speedChanges' | 'organize' | 'history' | 'bpmTiming'>('main');
+  const [isOrganizingNotes, setIsOrganizingNotes] = useState(false);
   const [isLeftPanelCompact, setIsLeftPanelCompact] = useState(false);
   const [isRightPanelCompact, setIsRightPanelCompact] = useState(false);
   const [isLeftPanelContentVisible, setIsLeftPanelContentVisible] = useState(true);
@@ -2100,6 +2101,8 @@ export default function Editor({
   };
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (isOrganizingNotes) return;
+
     const canvas = canvasRef.current;
     if (!canvas || !projectData) return;
 
@@ -2253,6 +2256,8 @@ export default function Editor({
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (isOrganizingNotes) return;
+
     const canvas = canvasRef.current;
     if (!canvas || !projectData) return;
 
@@ -2332,6 +2337,8 @@ export default function Editor({
   };
 
   const handleCanvasMouseUp = () => {
+    if (isOrganizingNotes) return;
+
     finishPendingDrag();
 
     if (selectionBox) {
@@ -2383,6 +2390,8 @@ export default function Editor({
   };
 
   const handleCanvasMouseLeave = () => {
+    if (isOrganizingNotes) return;
+
     setHoverPreview(null);
     handleCanvasMouseUp();
   };
@@ -2504,77 +2513,89 @@ export default function Editor({
   };
 
   const handleOrganizeNotes = () => {
-    const pendingUpdate = pendingDragUpdateRef.current;
-    const sourceNotes = stateRef.current.notes.map(note => (
-      pendingUpdate && note.id === pendingUpdate.noteId
-        ? { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane }
-        : note
-    ));
-
-    if (sourceNotes.length === 0) {
+    if (isOrganizingNotes || stateRef.current.notes.length === 0) {
       return;
     }
 
-    if (dragUpdateFrameRef.current) {
-      cancelAnimationFrame(dragUpdateFrameRef.current);
-      dragUpdateFrameRef.current = undefined;
-    }
+    setIsOrganizingNotes(true);
 
-    const sortedNotes = sourceNotes
-      .map((note, originalIndex) => ({
-        note,
-        originalIndex,
-        timepos: getTimeposFromTime(note.time),
-      }))
-      .sort((a, b) => (
-        (a.timepos - b.timepos)
-        || (a.note.lane - b.note.lane)
-        || (a.note.id - b.note.id)
-        || (a.originalIndex - b.originalIndex)
-      ));
-    const nextIdByOriginalId = new Map<number, number>();
+    window.requestAnimationFrame(() => {
+      try {
+        const pendingUpdate = pendingDragUpdateRef.current;
+        const sourceNotes = stateRef.current.notes.map(note => (
+          pendingUpdate && note.id === pendingUpdate.noteId
+            ? { ...note, time: pendingUpdate.time, lane: pendingUpdate.lane }
+            : note
+        ));
 
-    sortedNotes.forEach(({ note }, index) => {
-      nextIdByOriginalId.set(note.id, index + 1);
-    });
+        if (sourceNotes.length === 0) {
+          return;
+        }
 
-    const organizedNotes = sourceNotes.map(note => ({
-      ...note,
-      id: nextIdByOriginalId.get(note.id) ?? note.id,
-      parentId: note.parentId === null
-        ? null
-        : nextIdByOriginalId.get(note.parentId) ?? note.parentId,
-    }));
-    const changedCount = organizedNotes.reduce((count, note, index) => {
-      const previousNote = sourceNotes[index];
-      return count + (note.id !== previousNote.id || note.parentId !== previousNote.parentId ? 1 : 0);
-    }, 0);
+        if (dragUpdateFrameRef.current) {
+          cancelAnimationFrame(dragUpdateFrameRef.current);
+          dragUpdateFrameRef.current = undefined;
+        }
 
-    setNotes(organizedNotes);
-    setSelectedNoteIds(prev => prev
-      .map(id => nextIdByOriginalId.get(id))
-      .filter((id): id is number => id !== undefined));
-    setDraggingNoteId(null);
-    setSelectionBox(null);
-    setHoverPreview(null);
-    pendingDragUpdateRef.current = null;
-    dragStartNoteRef.current = null;
-    renderPausedTimelineAtFullFps();
+        const sortedNotes = sourceNotes
+          .map((note, originalIndex) => ({
+            note,
+            originalIndex,
+            timepos: getTimeposFromTime(note.time),
+          }))
+          .sort((a, b) => (
+            (a.timepos - b.timepos)
+            || (a.note.lane - b.note.lane)
+            || (a.note.id - b.note.id)
+            || (a.originalIndex - b.originalIndex)
+          ));
+        const nextIdByOriginalId = new Map<number, number>();
 
-    if (currentParentInput.trim() !== '') {
-      const currentParentId = parseInt(currentParentInput, 10);
-      if (!Number.isNaN(currentParentId)) {
-        const nextParentId = nextIdByOriginalId.get(currentParentId);
-        setCurrentParentInput(nextParentId === undefined ? '' : nextParentId.toString());
+        sortedNotes.forEach(({ note }, index) => {
+          nextIdByOriginalId.set(note.id, index + 1);
+        });
+
+        const organizedNotes = sourceNotes.map(note => ({
+          ...note,
+          id: nextIdByOriginalId.get(note.id) ?? note.id,
+          parentId: note.parentId === null
+            ? null
+            : nextIdByOriginalId.get(note.parentId) ?? note.parentId,
+        }));
+        const changedCount = organizedNotes.reduce((count, note, index) => {
+          const previousNote = sourceNotes[index];
+          return count + (note.id !== previousNote.id || note.parentId !== previousNote.parentId ? 1 : 0);
+        }, 0);
+
+        setNotes(organizedNotes);
+        setSelectedNoteIds(prev => prev
+          .map(id => nextIdByOriginalId.get(id))
+          .filter((id): id is number => id !== undefined));
+        setDraggingNoteId(null);
+        setSelectionBox(null);
+        setHoverPreview(null);
+        pendingDragUpdateRef.current = null;
+        dragStartNoteRef.current = null;
+        renderPausedTimelineAtFullFps();
+
+        if (currentParentInput.trim() !== '') {
+          const currentParentId = parseInt(currentParentInput, 10);
+          if (!Number.isNaN(currentParentId)) {
+            const nextParentId = nextIdByOriginalId.get(currentParentId);
+            setCurrentParentInput(nextParentId === undefined ? '' : nextParentId.toString());
+          }
+        }
+
+        recordOperation({
+          category: 'note',
+          title: 'Organized notes',
+          detail: changedCount === 0
+            ? `${sourceNotes.length} notes were already in time/xpos order`
+            : `Reassigned ${sourceNotes.length} note IDs by timepos, xpos, then original ID`,
+        });
+      } finally {
+        setIsOrganizingNotes(false);
       }
-    }
-
-    recordOperation({
-      category: 'note',
-      title: 'Organized notes',
-      detail: changedCount === 0
-        ? `${sourceNotes.length} notes were already in time/xpos order`
-        : `Reassigned ${sourceNotes.length} note IDs by timepos, xpos, then original ID`,
     });
   };
 
@@ -3538,8 +3559,8 @@ export default function Editor({
                 <button onClick={() => setActiveLeftPanel('speedChanges')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
                   Speed Changes
                 </button>
-                <button onClick={() => setActiveLeftPanel('curveSC')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
-                  Curve SC
+                <button onClick={() => setActiveLeftPanel('organize')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
+                  Organize
                 </button>
                 <button onClick={() => setActiveLeftPanel('history')} className="w-full text-left px-3 py-2 text-sm text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors">
                   Operation History
@@ -3774,19 +3795,29 @@ export default function Editor({
             </div>
           )}
 
-          {isLeftPanelContentVisible && ['curveSC', 'history'].includes(activeLeftPanel) && (
+          {isLeftPanelContentVisible && ['organize', 'history'].includes(activeLeftPanel) && (
             <div className="p-4 flex flex-col h-full overflow-hidden min-h-0">
               <div className="flex items-center gap-2 mb-4 shrink-0">
                 <button onClick={() => setActiveLeftPanel('main')} className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-white transition-colors">
                   <ArrowLeft className="w-4 h-4" />
                 </button>
                 <div className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
-                  {activeLeftPanel === 'curveSC' ? 'Curve SC' : 'History'}
+                  {activeLeftPanel === 'organize' ? 'Organize' : 'History'}
                 </div>
               </div>
-              {activeLeftPanel === 'curveSC' ? (
-                <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
-                  Not implemented yet
+              {activeLeftPanel === 'organize' ? (
+                <div className="flex-1">
+                  <button
+                    type="button"
+                    onClick={handleOrganizeNotes}
+                    disabled={notes.length === 0 || isOrganizingNotes}
+                    className="w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-neutral-800 disabled:text-neutral-500"
+                  >
+                    {isOrganizingNotes ? 'Organizing...' : 'Organize Notes'}
+                  </button>
+                  <p className="mt-2 text-xs leading-5 text-neutral-500">
+                    Reassigns note IDs from earliest to latest timepos, then left to right by xpos. Notes sharing the same timepos and xpos keep their original ID order, and parent links are remapped to stay grouped with their children.
+                  </p>
                 </div>
               ) : operationHistory.length === 0 ? (
                 <div className="flex-1 flex items-center justify-center text-sm text-neutral-600 border border-dashed border-neutral-800 rounded-lg p-4 text-center">
