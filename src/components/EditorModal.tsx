@@ -1,6 +1,5 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { X } from 'lucide-react';
 import type { EditorFormData } from '../types/editorTypes';
 
 interface EditorModalProps {
@@ -38,9 +37,6 @@ export default function EditorModal({ isOpen, onClose, onConfirm, formData, setF
               <h2 className="text-xl font-bold text-white">
                 New Project Details
               </h2>
-              <button onClick={onClose} className="text-neutral-400 hover:text-white">
-                <X className="w-5 h-5" />
-              </button>
             </div>
             <div className="space-y-4">
               <input type="text" placeholder="Song ID *" value={formData.songId} required className="w-full p-3 bg-neutral-800 rounded-lg border border-neutral-700 focus:border-indigo-500 outline-none transition-colors" onChange={(e) => setFormData({...formData, songId: e.target.value})} />
@@ -66,9 +62,14 @@ export default function EditorModal({ isOpen, onClose, onConfirm, formData, setF
                 />
               </div>
 
-              <button onClick={onConfirm} className="w-full p-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold transition-colors">
-                Confirm
-              </button>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <button onClick={onClose} className="w-full p-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg font-semibold transition-colors">
+                  Return to Landing
+                </button>
+                <button onClick={onConfirm} className="w-full p-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold transition-colors">
+                  Confirm
+                </button>
+              </div>
             </div>
           </motion.div>
         </div>

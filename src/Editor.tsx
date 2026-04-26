@@ -2760,7 +2760,7 @@ export default function Editor({
         isOpen={isModalOpen} 
         onClose={() => {
           if (mode === 'new') {
-            alert('Please complete the project setup.');
+            onBack();
             return;
           }
           setIsModalOpen(false);
